@@ -29,10 +29,14 @@ pub mod tun;
 #[path = "udp_unix.rs"]
 pub mod udp;
 
+use core::panic;
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::ControlFlow;
 use std::os::unix::io::AsRawFd;
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -43,6 +47,7 @@ use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use allowed_ips::AllowedIps;
+use libc::recvmmsg;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use tun::{errno, errno_str, TunSocket};
@@ -182,7 +187,7 @@ impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
         let n_threads = config.n_threads;
         log::info!("creating device");
-        let mut wg_interface: Device = Device::new(name, config)?;
+        let wg_interface: Device = Device::new(name, config)?;
 
         log::info!("device: {wg_interface:?}");
 
@@ -410,7 +415,7 @@ impl Device {
         };
 
         if let Some(config_string) = &config.config_string {
-            device.read_config_string(config_string);
+            device.read_config_string(config_string)?;
         } else {
             panic!();
         }
@@ -745,50 +750,155 @@ impl Device {
     ) -> Result<(), Error> {
         self.queue.new_event(
             udp.as_raw_fd(),
-            Box::new(move |_, t| {
+            Box::new(move |d, t| {
                 // The conn_handler handles packet received from a connected UDP socket, associated
                 // with a known peer, this saves us the hustle of finding the right peer. If another
                 // peer gets the same ip, it will be ignored until the socket does not expire.
                 let iface = &t.iface;
-                let mut iter = MAX_ITR;
+                //let mut iter = MAX_ITR;
 
-                while let Ok(src) = udp.read(&mut t.src_buf[..]) {
-                    let mut flush = false;
-                    match peer
-                        .tunnel
-                        .decapsulate(Some(peer_addr), src, &mut t.dst_buf[..])
-                    {
-                        TunnResult::Done => {}
-                        TunnResult::Err(e) => eprintln!("Decapsulate error {:?}", e),
-                        TunnResult::WriteToNetwork(packet) => {
-                            flush = true;
-                            udp.write(packet);
-                        }
-                        TunnResult::WriteToTunnelV4(packet, addr) => {
-                            if peer.is_allowed_ip(addr) {
-                                iface.write4(packet);
-                            }
-                        }
-                        TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if peer.is_allowed_ip(addr) {
-                                iface.write6(packet);
-                            }
-                        }
+                let mtu = d.mtu.load(Ordering::Relaxed);
+
+                let mut big_buf = vec![0u8; mtu * 10];
+                // let mut buffers = vec![vec![0u8; MAX_UDP_SIZE]; 10];
+                let mut msghdrs = vec![];
+
+                for buffer in big_buf.chunks_exact_mut(mtu) {
+                    // XXX: only works for ipv4
+                    let mut source: nix::libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                    let mut msg_iov = vec![nix::libc::iovec {
+                        // TODO: is this safe?!?!? sure
+                        iov_base: buffer.as_mut_ptr() as *mut _,
+                        iov_len: buffer.len().min(mtu),
+                    }];
+                    //let mut msg_control = vec![0u8; 2048];
+
+                    let msg_header = nix::libc::msghdr {
+                        msg_name: &mut source as *mut _ as *mut c_void,
+                        msg_namelen: size_of_val(&source) as u32,
+                        msg_iov: msg_iov.as_mut_ptr() as *mut _,
+                        msg_iovlen: msg_iov.len(),
+                        //msg_control: msg_control.as_mut_ptr() as *mut _,
+                        //msg_controllen: msg_control.len(),
+                        msg_control: null_mut(),
+                        msg_controllen: 0,
+                        msg_flags: 0,
+                    };
+                    let mmsg_header = nix::libc::mmsghdr {
+                        msg_hdr: msg_header,
+                        msg_len: 0,
                     };
 
-                    if flush {
-                        // Flush pending queue
-                        while let TunnResult::WriteToNetwork(packet) =
-                            peer.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
+                    msghdrs.push(mmsg_header);
+                }
+
+                for _ in 0..MAX_ITR {
+                    log::info!("calling recvmmmsg");
+
+                    let number_of_messages = unsafe {
+                        recvmmsg(
+                            iface.as_raw_fd(),
+                            msghdrs.as_mut_ptr(),
+                            msghdrs.len() as u32,
+                            libc::MSG_DONTWAIT,
+                            null_mut(),
+                        )
+                    };
+
+                    if number_of_messages < 0 {
+                        let err = io::Error::last_os_error();
+                        match err.kind() {
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => {
+                                log::debug!("would block");
+                                break;
+                            }
+                            _ => {
+                                eprintln!("Fatal read error on tun interface: {}", err);
+                                return Action::Exit;
+                            }
+                        }
+                    }
+                    let number_of_messages = number_of_messages as usize;
+
+                    log::info!("number_of_messages: {number_of_messages}");
+                    for (header, buf) in msghdrs
+                        .iter()
+                        .take(number_of_messages)
+                        .zip(big_buf.chunks_exact(mtu))
+                    {
+                        let n = header.msg_len as usize;
+                        let src = &buf[..n];
+
+                        let mut flush = false;
+                        match peer
+                            .tunnel
+                            .decapsulate(Some(peer_addr), src, &mut t.dst_buf[..])
                         {
-                            udp.write(packet);
+                            TunnResult::Done => {}
+                            TunnResult::Err(e) => eprintln!("Decapsulate error {:?}", e),
+                            TunnResult::WriteToNetwork(packet) => {
+                                flush = true;
+                                udp.write(packet);
+                            }
+                            TunnResult::WriteToTunnelV4(packet, addr) => {
+                                if peer.is_allowed_ip(addr) {
+                                    iface.write4(packet);
+                                }
+                            }
+                            TunnResult::WriteToTunnelV6(packet, addr) => {
+                                if peer.is_allowed_ip(addr) {
+                                    iface.write6(packet);
+                                }
+                            }
+                        };
+
+                        if flush {
+                            // Flush pending queue
+                            while let TunnResult::WriteToNetwork(packet) =
+                                peer.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
+                            {
+                                udp.write(packet);
+                            }
                         }
                     }
 
-                    iter -= 1;
-                    if iter == 0 {
-                        break;
-                    }
+                    //while let Ok(src) = udp.read(&mut t.src_buf[..]) {
+                    // let mut flush = false;
+                    // match peer
+                    //     .tunnel
+                    //     .decapsulate(Some(peer_addr), src, &mut t.dst_buf[..])
+                    // {
+                    //     TunnResult::Done => {}
+                    //     TunnResult::Err(e) => eprintln!("Decapsulate error {:?}", e),
+                    //     TunnResult::WriteToNetwork(packet) => {
+                    //         flush = true;
+                    //         udp.write(packet);
+                    //     }
+                    //     TunnResult::WriteToTunnelV4(packet, addr) => {
+                    //         if peer.is_allowed_ip(addr) {
+                    //             iface.write4(packet);
+                    //         }
+                    //     }
+                    //     TunnResult::WriteToTunnelV6(packet, addr) => {
+                    //         if peer.is_allowed_ip(addr) {
+                    //             iface.write6(packet);
+                    //         }
+                    //     }
+                    // };
+
+                    // if flush {
+                    //     // Flush pending queue
+                    //     while let TunnResult::WriteToNetwork(packet) =
+                    //         peer.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
+                    //     {
+                    //         udp.write(packet);
+                    //     }
+                    // }
+
+                    // iter -= 1;
+                    // if iter == 0 {
+                    //     break;
+                    // }
                 }
                 Action::Continue
             }),
@@ -831,9 +941,6 @@ impl Device {
 
                     let dst_addr = match Tunn::dst_address(src) {
                         Some(addr) => addr,
-                        None if cfg!(debug_assertions) => {
-                            panic!("Got an invalid packet from the tunnel device. Is it incorrectly configured?");
-                        }
                         None => continue,
                     };
 
@@ -868,4 +975,46 @@ impl Device {
         )?;
         Ok(())
     }
+}
+
+fn fun_name(
+    src: &[u8],
+    peers: &AllowedIps<Arc<Peer>>,
+    t: &mut ThreadData,
+    udp4: &Arc<UDPSocket>,
+    udp6: &Arc<UDPSocket>,
+) -> ControlFlow<()> {
+    let dst_addr = match Tunn::dst_address(src) {
+        Some(addr) => addr,
+        None if cfg!(debug_assertions) => {
+            panic!("Got an invalid packet from the tunnel device. Is it incorrectly configured?");
+        }
+        None => return ControlFlow::Break(()),
+    };
+    let peer = match peers.find(dst_addr) {
+        Some(peer) => peer,
+        None => return ControlFlow::Break(()),
+    };
+    match peer.tunnel.encapsulate(src, &mut t.dst_buf[..]) {
+        TunnResult::Done => {}
+        TunnResult::Err(e) => {
+            tracing::error!(message = "Encapsulate error", error = ?e)
+        }
+        TunnResult::WriteToNetwork(packet) => {
+            let endpoint = peer.endpoint();
+            if let Some(ref conn) = endpoint.conn {
+                // Prefer to send using the connected socket
+                conn.write(packet);
+            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                udp4.sendto(packet, addr);
+            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                udp6.sendto(packet, addr);
+            } else {
+                tracing::error!("No endpoint");
+            }
+        }
+        _ => panic!("Unexpected result from encapsulate"),
+    };
+
+    ControlFlow::Continue(())
 }
