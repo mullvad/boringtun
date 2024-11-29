@@ -357,7 +357,18 @@ impl UDPSocket {
 
     /// Receives a message on a connected UDP socket and returns its contents
     pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
-        match unsafe { recv(self.fd, &mut dst[0] as *mut u8 as _, dst.len(), 0) } {
+        // FIXME: Missing `SAFETY`
+        // From `nix`: https://docs.rs/nix/latest/src/nix/sys/socket/mod.rs.html#1676-1678
+        let timeout_ptr = std::ptr::null_mut() as *mut libc::timespec;
+        match unsafe {
+            recvmmsg(
+                self.fd,
+                &mut dst[0] as *mut u8 as _,
+                dst.len() as _,
+                0,
+                timeout_ptr,
+            )
+        } {
             -1 => Err(Error::UDPRead(errno())),
             n => Ok(&mut dst[..n as usize]),
         }
