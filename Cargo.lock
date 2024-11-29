@@ -83,6 +83,7 @@ dependencies = [
  "ip_network_table",
  "jni",
  "libc",
+ "log",
  "nix",
  "parking_lot",
  "rand_core",

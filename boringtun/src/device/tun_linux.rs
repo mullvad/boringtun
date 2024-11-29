@@ -39,6 +39,7 @@ union IfrIfru {
     ifru_functional_type: u32,
 }
 
+// TODO: WHY??? WHY NOT LIBC??
 #[repr(C)]
 pub struct ifreq {
     ifr_name: [c_uchar; IFNAMSIZ],
@@ -86,7 +87,7 @@ impl TunSocket {
             fd => fd,
         };
         let iface_name = name.as_bytes();
-        let mut ifr = ifreq {
+        let mut ifr: ifreq = ifreq {
             ifr_name: [0; IFNAMSIZ],
             ifr_ifru: IfrIfru {
                 ifru_flags: (IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE) as _,
@@ -100,6 +101,7 @@ impl TunSocket {
         ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
 
         if unsafe { ioctl(fd, TUNSETIFF as _, &ifr) } < 0 {
+            log::error!("failed to set TUNSETIFF ioctl, fd:{fd:?}, TUNSETIFF:{TUNSETIFF:?}");
             return Err(Error::IOCtl(errno_str()));
         }
 

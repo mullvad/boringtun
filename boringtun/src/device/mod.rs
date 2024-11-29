@@ -154,13 +154,17 @@ struct ThreadData {
 impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
         let n_threads = config.n_threads;
-        let mut wg_interface = Device::new(name, config)?;
+        log::info!("creating device");
+        let mut wg_interface: Device = Device::new(name, config)?;
+
+        log::info!("open_listen_socket");
         wg_interface.open_listen_socket(0)?; // Start listening on a random port
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
-        let mut threads = vec![];
+        let mut threads: Vec<JoinHandle<()>> = vec![];
 
+        log::info!("spawning worker threads");
         for i in 0..n_threads {
             threads.push({
                 let dev = Arc::clone(&interface_lock);
@@ -340,7 +344,13 @@ impl Device {
         let poll = EventPoll::<Handler>::new()?;
 
         // Create a tunnel device
-        let iface = Arc::new(TunSocket::new(name)?.set_non_blocking()?);
+        log::info!("creating TunSocket");
+        let tun_socket = TunSocket::new(name)?;
+        log::info!("setting non-blocking");
+        let tun_socket = tun_socket.set_non_blocking()?;
+        let iface = Arc::new(tun_socket);
+
+        log::info!("setting MTU");
         let mtu = iface.mtu()?;
 
         #[cfg(not(target_os = "linux"))]
@@ -371,12 +381,17 @@ impl Device {
         };
 
         if uapi_fd >= 0 {
+            log::info!("registering uapi handler");
             device.register_api_fd(uapi_fd)?;
         } else {
+            log::info!("registering iface handler");
             device.register_api_handler()?;
         }
+        log::info!("register_iface_handler");
         device.register_iface_handler(Arc::clone(&device.iface))?;
+        log::info!("register_notifiers");
         device.register_notifiers()?;
+        log::info!("register_timers");
         device.register_timers()?;
 
         #[cfg(target_os = "macos")]
