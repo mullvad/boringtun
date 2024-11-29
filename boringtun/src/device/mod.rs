@@ -186,8 +186,8 @@ impl DeviceHandle {
 
         log::info!("device: {wg_interface:?}");
 
-        log::info!("open_listen_socket");
-        wg_interface.open_listen_socket(0)?; // Start listening on a random port
+        //log::info!("open_listen_socket");
+        //wg_interface.open_listen_socket(0)?; // Start listening on a random port
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
