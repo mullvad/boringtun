@@ -357,9 +357,15 @@ impl UDPSocket {
 
     /// Receives a message on a connected UDP socket and returns its contents
     pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
-        match unsafe { recv(self.fd, &mut dst[0] as *mut u8 as _, dst.len(), 0) } {
-            -1 => Err(Error::UDPRead(errno())),
-            n => Ok(&mut dst[..n as usize]),
+        let ioslice = std::io::IoSliceMut::new(dst);
+        match nix::sys::socket::recvmsg::<()>(
+            self.fd,
+            &mut [ioslice],
+            None,
+            nix::sys::socket::MsgFlags::empty(),
+        ) {
+            Ok(msg) => Ok(&mut dst[..msg.bytes]),
+            Err(_) => Err(Error::UDPRead(errno())),
         }
     }
 
