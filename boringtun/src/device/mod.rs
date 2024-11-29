@@ -661,10 +661,10 @@ impl Device {
 
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
-                let chunk_size = mtu;
+                let chunk_size = MAX_UDP_SIZE;
 
-                let mut big_buf = vec![0u8; chunk_size * 1];
-                // let mut buffers = vec![vec![0u8; MAX_UDP_SIZE]; 10];
+                // FIXME: breaks with more than one chunk
+                let mut big_buf = vec![0u8; 8 * chunk_size];
                 let mut msghdrs = vec![];
                 let mut addrs = vec![];
                 let mut msg_iov = vec![];
@@ -673,9 +673,8 @@ impl Device {
                 // TODO: use nix recvmmsg. it does not alloc
 
                 for buffer in big_buf.chunks_exact_mut(chunk_size) {
-                    log::debug!("mtu {mtu}, buf size: {}", buffer.len());
+                    //log::debug!("mtu {mtu}, buf size: {}", buffer.len());
 
-                    // XXX: only works for ipv4
                     addrs.push(unsafe { std::mem::zeroed() });
                     let source: &mut libc::sockaddr_storage = addrs.last_mut().unwrap();
 
@@ -688,7 +687,7 @@ impl Device {
 
                     let msg_header = nix::libc::msghdr {
                         msg_name: source as *mut _ as *mut c_void,
-                        msg_namelen: size_of_val(&source) as u32,
+                        msg_namelen: size_of_val(source) as u32,
                         msg_iov: msg_iov.last_mut().unwrap() as *mut _,
                         msg_iovlen: 1,
                         //msg_control: msg_control.as_mut_ptr() as *mut _,
@@ -699,14 +698,14 @@ impl Device {
                     };
                     let mmsg_header = nix::libc::mmsghdr {
                         msg_hdr: msg_header,
-                        msg_len: 1,
+                        msg_len: 0,
                     };
 
                     msghdrs.push(mmsg_header);
                 }
 
 
-                println!("recvmsg");
+                //println!("recvmsg");
                 let number_of_messages = unsafe {
                     recvmmsg(
                         (*udp).as_raw_fd(),
@@ -724,14 +723,18 @@ impl Device {
                 }
                 let number_of_messages = number_of_messages as usize;
 
-                println!("number_of_messages: {number_of_messages}");
-                log::info!("jdsaojaids");
+                // FIXME: segfault
+
+                //println!("number_of_messages: {number_of_messages}");
+                //log::info!("jdsaojaids");
                 for (header, packet) in msghdrs
                     .iter()
                     .take(number_of_messages)
                     .zip(big_buf.chunks_exact(chunk_size))
                 {
-                    let addr_in = unsafe { SockaddrStorage::from_raw(header.msg_hdr.msg_name as _, Some(std::mem::size_of::<nix::libc::sockaddr_in>() as u32)) }.unwrap();
+                    let packet = &packet[..header.msg_len as usize];
+
+                    let addr_in = unsafe { SockaddrStorage::from_raw(header.msg_hdr.msg_name as _, Some(header.msg_hdr.msg_namelen as u32)) }.unwrap();
                     let addr = if let Some(addr) = addr_in.as_sockaddr_in() {
                         SocketAddr::from(SocketAddrV4::from(*addr))
                     } else if let Some(addr) = addr_in.as_sockaddr_in6() {
@@ -739,9 +742,11 @@ impl Device {
                     } else {
                         break;
                     };
-                    println!("receiving from {addr}");
+                    //println!("receiving from {addr}");
 
                     // FIXME: addr can be v6
+
+                    //println!("parsing packet");
 
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet =
@@ -767,6 +772,8 @@ impl Device {
                         Packet::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
                         Packet::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
                     };
+
+                    //println!("peer: {peer:?}");
 
                     let peer = match peer {
                         None => continue,
