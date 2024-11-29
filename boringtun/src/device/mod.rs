@@ -91,7 +91,7 @@ pub struct DeviceHandle {
     threads: Vec<JoinHandle<()>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DeviceConfig {
     pub n_threads: usize,
     pub use_connected_socket: bool,
@@ -99,6 +99,7 @@ pub struct DeviceConfig {
     pub use_multi_queue: bool,
     #[cfg(target_os = "linux")]
     pub uapi_fd: i32,
+    pub config_string: Option<String>,
 }
 
 impl Default for DeviceConfig {
@@ -110,6 +111,7 @@ impl Default for DeviceConfig {
             use_multi_queue: true,
             #[cfg(target_os = "linux")]
             uapi_fd: -1,
+            config_string: None,
         }
     }
 }
@@ -145,6 +147,31 @@ pub struct Device {
     uapi_fd: i32,
 }
 
+impl std::fmt::Debug for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Device")
+            //.field("key_pair", &self.key_pair)
+            //.field("queue", &self.queue)
+            .field("listen_port", &self.listen_port)
+            .field("fwmark", &self.fwmark)
+            .field("iface", &self.iface)
+            .field("udp4", &self.udp4)
+            .field("udp6", &self.udp6)
+            //.field("yield_notice", &self.yield_notice)
+            //.field("exit_notice", &self.exit_notice)
+            .field("peers", &self.peers)
+            //.field("peers_by_ip", &self.peers_by_ip)
+            //.field("peers_by_idx", &self.peers_by_idx)
+            .field("next_index", &self.next_index)
+            .field("config", &self.config)
+            .field("cleanup_paths", &self.cleanup_paths)
+            .field("mtu", &self.mtu)
+            //.field("rate_limiter", &self.rate_limiter)
+            .field("uapi_fd", &self.uapi_fd)
+            .finish()
+    }
+}
+
 struct ThreadData {
     iface: Arc<TunSocket>,
     src_buf: [u8; MAX_UDP_SIZE],
@@ -156,6 +183,8 @@ impl DeviceHandle {
         let n_threads = config.n_threads;
         log::info!("creating device");
         let mut wg_interface: Device = Device::new(name, config)?;
+
+        log::info!("device: {wg_interface:?}");
 
         log::info!("open_listen_socket");
         wg_interface.open_listen_socket(0)?; // Start listening on a random port
@@ -361,7 +390,7 @@ impl Device {
         let mut device = Device {
             queue: Arc::new(poll),
             iface,
-            config,
+            config: config.clone(),
             exit_notice: Default::default(),
             yield_notice: Default::default(),
             fwmark: Default::default(),
@@ -380,13 +409,18 @@ impl Device {
             uapi_fd,
         };
 
-        if uapi_fd >= 0 {
-            log::info!("registering uapi handler");
-            device.register_api_fd(uapi_fd)?;
+        if let Some(config_string) = &config.config_string {
+            device.read_config_string(config_string);
         } else {
-            log::info!("registering iface handler");
-            device.register_api_handler()?;
+            panic!();
         }
+        // } else if uapi_fd >= 0 {
+        //     log::info!("registering uapi handler");
+        //     device.register_api_fd(uapi_fd)?;
+        // } else {
+        //     log::info!("registering iface handler");
+        //     device.register_api_handler()?;
+        // }
         log::info!("register_iface_handler");
         device.register_iface_handler(Arc::clone(&device.iface))?;
         log::info!("register_notifiers");

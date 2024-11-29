@@ -27,6 +27,18 @@ pub struct Peer {
     preshared_key: Option<[u8; 32]>,
 }
 
+impl std::fmt::Debug for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Peer")
+            //.field("tunnel", &self.tunnel)
+            .field("index", &self.index)
+            .field("endpoint", &self.endpoint)
+            //.field("allowed_ips", &self.allowed_ips)
+            .field("preshared_key", &self.preshared_key)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct AllowedIP {
     pub addr: IpAddr,
