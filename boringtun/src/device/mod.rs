@@ -32,8 +32,8 @@ pub mod udp;
 use core::panic;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::{io, ptr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ops::ControlFlow;
 use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
@@ -47,7 +47,8 @@ use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use allowed_ips::AllowedIps;
-use libc::recvmmsg;
+use libc::{recvmmsg, MSG_DONTWAIT};
+use nix::sys::socket::{MultiHeaders, SockaddrIn, SockaddrLike, SockaddrStorage};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use tun::{errno, errno_str, TunSocket};
@@ -647,6 +648,8 @@ impl Device {
     }
 
     fn register_udp_handler(&self, udp: Arc<UDPSocket>) -> Result<(), Error> {
+        log::debug!("register_udp_handler");
+
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -656,8 +659,173 @@ impl Device {
 
                 let rate_limiter = d.rate_limiter.as_ref().unwrap();
 
+                let mtu = d.mtu.load(Ordering::Relaxed);
+
+                let chunk_size = mtu;
+
+                let mut big_buf = vec![0u8; chunk_size * 1];
+                // let mut buffers = vec![vec![0u8; MAX_UDP_SIZE]; 10];
+                let mut msghdrs = vec![];
+                let mut addrs = vec![];
+                let mut msg_iov = vec![];
+
+                // FIXME: creates buffer
+                // TODO: use nix recvmmsg. it does not alloc
+
+                for buffer in big_buf.chunks_exact_mut(chunk_size) {
+                    log::debug!("mtu {mtu}, buf size: {}", buffer.len());
+
+                    // XXX: only works for ipv4
+                    addrs.push(unsafe { std::mem::zeroed() });
+                    let source: &mut libc::sockaddr_storage = addrs.last_mut().unwrap();
+
+                    msg_iov.push(nix::libc::iovec {
+                        // TODO: is this safe?!?!? sure
+                        iov_base: buffer.as_mut_ptr() as *mut _,
+                        iov_len: buffer.len(),
+                    });
+                    //let mut msg_control = vec![0u8; 2048];
+
+                    let msg_header = nix::libc::msghdr {
+                        msg_name: source as *mut _ as *mut c_void,
+                        msg_namelen: size_of_val(&source) as u32,
+                        msg_iov: msg_iov.last_mut().unwrap() as *mut _,
+                        msg_iovlen: 1,
+                        //msg_control: msg_control.as_mut_ptr() as *mut _,
+                        //msg_controllen: msg_control.len(),
+                        msg_control: null_mut(),
+                        msg_controllen: 0,
+                        msg_flags: 0,
+                    };
+                    let mmsg_header = nix::libc::mmsghdr {
+                        msg_hdr: msg_header,
+                        msg_len: 1,
+                    };
+
+                    msghdrs.push(mmsg_header);
+                }
+
+
+                println!("recvmsg");
+                let number_of_messages = unsafe {
+                    recvmmsg(
+                        (*udp).as_raw_fd(),
+                        msghdrs.as_mut_ptr(),
+                        msghdrs.len() as u32,
+                        MSG_DONTWAIT,
+                        null_mut(),
+                    )
+                };
+
+                if number_of_messages < 0 {
+                    let err = io::Error::last_os_error();
+                    eprintln!("Failedx to read on udp socket: {err}");
+                    return Action::Continue;
+                }
+                let number_of_messages = number_of_messages as usize;
+
+                println!("number_of_messages: {number_of_messages}");
+                log::info!("jdsaojaids");
+                for (header, packet) in msghdrs
+                    .iter()
+                    .take(number_of_messages)
+                    .zip(big_buf.chunks_exact(chunk_size))
+                {
+                    let addr_in = unsafe { SockaddrStorage::from_raw(header.msg_hdr.msg_name as _, Some(std::mem::size_of::<nix::libc::sockaddr_in>() as u32)) }.unwrap();
+                    let addr = if let Some(addr) = addr_in.as_sockaddr_in() {
+                        SocketAddr::from(SocketAddrV4::from(*addr))
+                    } else if let Some(addr) = addr_in.as_sockaddr_in6() {
+                        SocketAddr::from(SocketAddrV6::from(*addr))
+                    } else {
+                        break;
+                    };
+                    println!("receiving from {addr}");
+
+                    // FIXME: addr can be v6
+
+                    // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
+                    let parsed_packet =
+                        match rate_limiter.verify_packet(Some(addr.ip()), packet, &mut t.dst_buf) {
+                            Ok(packet) => packet,
+                            Err(TunnResult::WriteToNetwork(cookie)) => {
+                                udp.sendto(cookie, addr);
+                                continue;
+                            }
+                            Err(_) => continue,
+                        };
+
+                    let peer = match &parsed_packet {
+                        Packet::HandshakeInit(p) => {
+                            parse_handshake_anon(private_key, public_key, p)
+                                .ok()
+                                .and_then(|hh| {
+                                    d.peers
+                                        .get(&x25519_dalek::PublicKey::from(hh.peer_static_public))
+                                })
+                        }
+                        Packet::HandshakeResponse(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        Packet::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        Packet::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
+                    };
+
+                    let peer = match peer {
+                        None => continue,
+                        Some(peer) => peer,
+                    };
+
+                    // We found a peer, use it to decapsulate the message+
+                    let mut flush = false; // Are there packets to send from the queue?
+                    match peer
+                        .tunnel
+                        .handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
+                    {
+                        TunnResult::Done => {}
+                        TunnResult::Err(_) => continue,
+                        TunnResult::WriteToNetwork(packet) => {
+                            flush = true;
+                            udp.sendto(packet, SocketAddr::from(addr));
+                        }
+                        TunnResult::WriteToTunnelV4(packet, addr) => {
+                            if peer.is_allowed_ip(addr) {
+                                t.iface.write4(packet);
+                            }
+                        }
+                        TunnResult::WriteToTunnelV6(packet, addr) => {
+                            if peer.is_allowed_ip(addr) {
+                                t.iface.write6(packet);
+                            }
+                        }
+                    };
+
+                    if flush {
+                        // Flush pending queue
+                        while let TunnResult::WriteToNetwork(packet) =
+                            peer.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
+                        {
+                            udp.sendto(packet, addr);
+                        }
+                    }
+
+                    // This packet was OK, that means we want to create a connected socket for this peer
+                    let ip_addr = addr.ip();
+                    peer.set_endpoint(addr);
+                    if d.config.use_connected_socket {
+                        if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.fwmark) {
+                            d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
+                                .unwrap();
+                        }
+                    }
+
+                    iter -= 1;
+                    if iter == 0 {
+                        break;
+                    }
+                }
+
+                Action::Continue
+
                 // Loop while we have packets on the anonymous connection
-                while let Ok((addr, packet)) = udp.recvfrom(&mut t.src_buf[..]) {
+                /*while let Ok((addr, packet)) = udp.recvfrom(&mut t.src_buf[..]) {
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet =
                         match rate_limiter.verify_packet(Some(addr.ip()), packet, &mut t.dst_buf) {
@@ -736,7 +904,7 @@ impl Device {
                         break;
                     }
                 }
-                Action::Continue
+                Action::Continue*/
             }),
         )?;
         Ok(())
@@ -764,6 +932,8 @@ impl Device {
                 let mut msghdrs = vec![];
 
                 for buffer in big_buf.chunks_exact_mut(mtu) {
+                    log::debug!("mtu {mtu}, buf size: {}", buffer.len());
+
                     // XXX: only works for ipv4
                     let mut source: nix::libc::sockaddr_in = unsafe { std::mem::zeroed() };
                     let mut msg_iov = vec![nix::libc::iovec {
