@@ -19,4 +19,5 @@ AllowedIPs = 10.100.123.2/32
 EOF
 
 sudo ip a add dev peer0 $PEER0_IP
+sudo ip l set dev peer0 up
 sudo wg setconf peer0 ./peer0.conf.temp
