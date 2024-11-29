@@ -13,6 +13,8 @@ documentation = "https://docs.rs/boringtun/0.5.2/boringtun/"
 edition = "2021"
 
 [features]
+default = []
+device = ["socket2", "thiserror"]
 jni-bindings = ["ffi-bindings", "jni"]
 ffi-bindings = []
 
@@ -37,6 +39,8 @@ blake2 = "0.10"
 hmac = "0.12"
 jni = { version = "0.19.0", optional = true }
 log = "0.4"
+socket2 = { version = "0.5", features = ["all"], optional = true }
+thiserror = { version = "2", optional = true }
 
 [target.'cfg(target_os="macos")'.dependencies]
 nix = "0.24.1"
