@@ -831,6 +831,9 @@ impl Device {
 
                     let dst_addr = match Tunn::dst_address(src) {
                         Some(addr) => addr,
+                        None if cfg!(debug_assertions) => {
+                            panic!("Got an invalid packet from the tunnel device. Is it incorrectly configured?");
+                        }
                         None => continue,
                     };
 
