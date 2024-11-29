@@ -191,6 +191,7 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
     }
 
     for (k, p) in d.peers.iter() {
+        let p = p.lock();
         writeln!(writer, "public_key={}", encode_hex(k.as_bytes()));
 
         if let Some(ref key) = p.preshared_key() {
@@ -247,6 +248,7 @@ fn api_set(reader: &mut impl BufRead, device: &mut Device) -> i32 {
                     },
                     Err(_) => return EINVAL,
                 },
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 "fwmark" => match val.parse::<u32>() {
                     Ok(mark) => match device.set_fwmark(mark) {
                         Ok(()) => {}

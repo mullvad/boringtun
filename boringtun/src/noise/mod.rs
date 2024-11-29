@@ -156,7 +156,7 @@ impl Tunn {
         static_private: x25519_dalek::StaticSecret,
         static_public: x25519_dalek::PublicKey,
         rate_limiter: Option<Arc<RateLimiter>>,
-    ) -> Result<(), WireGuardError> {
+    ) {
         self.inner
             .write()
             .set_static_private(static_private, static_public, rate_limiter)
@@ -308,8 +308,7 @@ impl TunnInner {
                 peer_static_public,
                 index << 8,
                 preshared_key,
-            )
-            .map_err(|_| "Invalid parameters")?,
+            ),
             sessions: Default::default(),
             current: Default::default(),
             tx_bytes: Default::default(),
@@ -331,17 +330,16 @@ impl TunnInner {
         static_private: x25519_dalek::StaticSecret,
         static_public: x25519_dalek::PublicKey,
         rate_limiter: Option<Arc<RateLimiter>>,
-    ) -> Result<(), WireGuardError> {
+    ) {
         self.timers.should_reset_rr = rate_limiter.is_none();
         self.rate_limiter = rate_limiter.unwrap_or_else(|| {
             Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
         });
         self.handshake
-            .set_static_private(static_private, static_public)?;
+            .set_static_private(static_private, static_public);
         for s in &mut self.sessions {
             *s = None;
         }
-        Ok(())
     }
 
     fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {

@@ -5,7 +5,7 @@
 //!
 //! <code>git clone https://github.com/cloudflare/boringtun.git</code>
 
-#[cfg(not(any(target_os = "windows", target_os = "android", target_os = "ios")))]
+// #[cfg(feature = "device")]
 pub mod device;
 
 #[cfg(feature = "ffi-bindings")]
@@ -16,3 +16,10 @@ pub mod noise;
 pub mod jni;
 
 pub(crate) mod serialization;
+
+/// Re-export of the x25519 types
+pub mod x25519 {
+    pub use x25519_dalek::{
+        EphemeralSecret, PublicKey, ReusableSecret, SharedSecret, StaticSecret,
+    };
+}
