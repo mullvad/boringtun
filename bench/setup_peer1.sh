@@ -18,4 +18,5 @@ EOF
 
 sudo ip a add dev peer1 $PEER1_IP
 sudo ip l set dev peer1 up
+sudo ip r add dev peer1 10.100.123.0/24
 sudo wg setconf peer1 ./peer1.conf.temp
