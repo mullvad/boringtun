@@ -178,14 +178,15 @@ impl std::fmt::Debug for Device {
     }
 }
 
-const RECVMSG_NUM_CHUNKS: usize = 10;
+const RECVMSG_NUM_CHUNKS: usize = 100;
+const SRCBUF_CHUNK_SIZE: usize = 5000;
 
 struct ThreadData {
     iface: Arc<TunSocket>,
     msghdrs: Vec<nix::libc::mmsghdr>,
     addrs: Vec<nix::libc::sockaddr_storage>,
     iovec: Vec<nix::libc::iovec>,
-    src_buf: [u8; RECVMSG_NUM_CHUNKS * MAX_UDP_SIZE],
+    src_buf: [u8; RECVMSG_NUM_CHUNKS * SRCBUF_CHUNK_SIZE],
     dst_buf: [u8; MAX_UDP_SIZE],
 }
 
@@ -237,7 +238,8 @@ impl DeviceHandle {
             addrs: Vec::with_capacity(RECVMSG_NUM_CHUNKS),
             iovec: Vec::with_capacity(RECVMSG_NUM_CHUNKS),
             msghdrs: Vec::with_capacity(RECVMSG_NUM_CHUNKS),
-            src_buf: [0u8; RECVMSG_NUM_CHUNKS * MAX_UDP_SIZE],
+            // FIXME: can we not use the stack? segfaults for MAX_UDP_SIZE * numchunks
+            src_buf: [0u8; RECVMSG_NUM_CHUNKS * SRCBUF_CHUNK_SIZE],
             dst_buf: [0u8; MAX_UDP_SIZE],
             iface: if _i == 0 || !device.read().config.use_multi_queue {
                 // For the first thread use the original iface
@@ -677,7 +679,7 @@ impl Device {
 
                 // TODO: use nix recvmmsg. it does not alloc
 
-                for buffer in t.src_buf.chunks_exact_mut(MAX_UDP_SIZE) {
+                for buffer in t.src_buf.chunks_exact_mut(SRCBUF_CHUNK_SIZE) {
                     //log::debug!("mtu {mtu}, buf size: {}", buffer.len());
 
                     addrs.push(unsafe { std::mem::zeroed() });
@@ -730,12 +732,12 @@ impl Device {
 
                 // FIXME: segfault
 
-                //println!("number_of_messages: {number_of_messages}");
+                println!("number_of_messages: {number_of_messages}");
                 //log::info!("jdsaojaids");
                 for (header, packet) in msghdrs
                     .iter()
                     .take(number_of_messages)
-                    .zip(t.src_buf.chunks_exact(MAX_UDP_SIZE))
+                    .zip(t.src_buf.chunks_exact(SRCBUF_CHUNK_SIZE))
                 {
                     //log::debug!("MSG LEN: {}", header.msg_len);
                     let packet = &packet[..header.msg_len as usize];
