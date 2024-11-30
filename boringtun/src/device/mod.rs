@@ -178,9 +178,14 @@ impl std::fmt::Debug for Device {
     }
 }
 
+const RECVMSG_NUM_CHUNKS: usize = 10;
+
 struct ThreadData {
     iface: Arc<TunSocket>,
-    src_buf: [u8; MAX_UDP_SIZE],
+    msghdrs: Vec<nix::libc::mmsghdr>,
+    addrs: Vec<nix::libc::sockaddr_storage>,
+    iovec: Vec<nix::libc::iovec>,
+    src_buf: [u8; RECVMSG_NUM_CHUNKS * MAX_UDP_SIZE],
     dst_buf: [u8; MAX_UDP_SIZE],
 }
 
@@ -229,7 +234,10 @@ impl DeviceHandle {
     fn event_loop(_i: usize, device: &Lock<Device>) {
         #[cfg(target_os = "linux")]
         let mut thread_local = ThreadData {
-            src_buf: [0u8; MAX_UDP_SIZE],
+            addrs: Vec::with_capacity(RECVMSG_NUM_CHUNKS),
+            iovec: Vec::with_capacity(RECVMSG_NUM_CHUNKS),
+            msghdrs: Vec::with_capacity(RECVMSG_NUM_CHUNKS),
+            src_buf: [0u8; RECVMSG_NUM_CHUNKS * MAX_UDP_SIZE],
             dst_buf: [0u8; MAX_UDP_SIZE],
             iface: if _i == 0 || !device.read().config.use_multi_queue {
                 // For the first thread use the original iface
@@ -659,20 +667,17 @@ impl Device {
 
                 let rate_limiter = d.rate_limiter.as_ref().unwrap();
 
-                let mtu = d.mtu.load(Ordering::Relaxed);
+                let msghdrs = &mut t.msghdrs;
+                let addrs = &mut t.addrs;
+                let msg_iov = &mut t.iovec;
 
-                let chunk_size = MAX_UDP_SIZE;
+                msghdrs.clear();
+                addrs.clear();
+                msg_iov.clear();
 
-                // FIXME: breaks with more than one chunk
-                let mut big_buf = vec![0u8; 8 * chunk_size];
-                let mut msghdrs = vec![];
-                let mut addrs = vec![];
-                let mut msg_iov = vec![];
-
-                // FIXME: creates buffer
                 // TODO: use nix recvmmsg. it does not alloc
 
-                for buffer in big_buf.chunks_exact_mut(chunk_size) {
+                for buffer in t.src_buf.chunks_exact_mut(MAX_UDP_SIZE) {
                     //log::debug!("mtu {mtu}, buf size: {}", buffer.len());
 
                     addrs.push(unsafe { std::mem::zeroed() });
@@ -730,8 +735,9 @@ impl Device {
                 for (header, packet) in msghdrs
                     .iter()
                     .take(number_of_messages)
-                    .zip(big_buf.chunks_exact(chunk_size))
+                    .zip(t.src_buf.chunks_exact(MAX_UDP_SIZE))
                 {
+                    //log::debug!("MSG LEN: {}", header.msg_len);
                     let packet = &packet[..header.msg_len as usize];
 
                     let addr_in = unsafe { SockaddrStorage::from_raw(header.msg_hdr.msg_name as _, Some(header.msg_hdr.msg_namelen as u32)) }.unwrap();
