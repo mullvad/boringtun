@@ -678,10 +678,10 @@ impl Device {
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
                 let chunk_size = mtu;
-                let mut big_buf = t.src_buf;
 
                 // TODO: move this allocation into thread_local storage
-                let mut io_vecs = big_buf
+                let mut io_vecs = t
+                    .src_buf
                     .chunks_exact_mut(chunk_size)
                     .take(MMSG_MAX_NUM_CHUNKS)
                     .map(IoSliceMut::new)
@@ -918,12 +918,12 @@ impl Device {
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
                 let chunk_size = mtu;
-                let mut big_buf = t.src_buf;
                 let chunk_count = t.src_buf.len() / chunk_size;
 
                 for _ in 0..MAX_ITR {
                     // TODO: move this allocation into thread_local storage
-                    let mut io_vecs = big_buf
+                    let mut io_vecs = t
+                        .src_buf
                         .chunks_exact_mut(chunk_size)
                         .map(IoSliceMut::new)
                         .map(|slice| [slice])
