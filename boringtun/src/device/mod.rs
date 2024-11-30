@@ -31,12 +31,10 @@ pub mod udp;
 
 use core::panic;
 use std::collections::HashMap;
-use std::ffi::c_void;
-use std::{io, ptr};
+use std::io;
+use std::io::IoSliceMut;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::ops::ControlFlow;
 use std::os::unix::io::AsRawFd;
-use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -47,8 +45,7 @@ use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use allowed_ips::AllowedIps;
-use libc::{recvmmsg, MSG_DONTWAIT};
-use nix::sys::socket::{MultiHeaders, SockaddrIn, SockaddrLike, SockaddrStorage};
+use nix::sys::socket::{recvmmsg, MsgFlags, MultiHeaders, SockaddrStorage};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use tun::{errno, errno_str, TunSocket};
@@ -58,8 +55,22 @@ use dev_lock::{Lock, LockReadGuard};
 
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
+#[allow(dead_code)]
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100; // Number of packets to handle per handler call
+
+// TODO: tune this value to figure out a good number
+// NOTE: the max number of messages that can be supported by the src_buf is BUF_LEN / MTU.
+const MMSG_MAX_NUM_CHUNKS: usize = 100; //
+
+// TODO: tune this value to figure out a good number
+// right now, it's based on MMSG_MAX_NUM_CHUNKS * 1380, where 1380 is a common MTU value
+const BUF_LEN: usize = 0x22000;
+
+// hacky assertion that BUF_LEN is large enough to hold any one UDP packet
+const _BUF_LEN_MUST_BE_LARGER_THAN_MIN_UDP_SIZE: () = {
+    let _ = 0 - ((BUF_LEN < MAX_UDP_SIZE) as u32);
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -178,16 +189,15 @@ impl std::fmt::Debug for Device {
     }
 }
 
-const RECVMSG_NUM_CHUNKS: usize = 100;
-const SRCBUF_CHUNK_SIZE: usize = 5000;
-
 struct ThreadData {
     iface: Arc<TunSocket>,
-    msghdrs: Vec<nix::libc::mmsghdr>,
-    addrs: Vec<nix::libc::sockaddr_storage>,
-    iovec: Vec<nix::libc::iovec>,
-    src_buf: [u8; RECVMSG_NUM_CHUNKS * SRCBUF_CHUNK_SIZE],
-    dst_buf: [u8; MAX_UDP_SIZE],
+    src_buf: [u8; BUF_LEN],
+    dst_buf: [u8; BUF_LEN],
+
+    // Buffers for calling recvmmsg and sendmmsg
+    header_buffers: MultiHeaders<SockaddrStorage>,
+    // TODO: figure out lifetimes, the io_vecs will refer to slices of src_buf 🫠
+    // io_vecs: Box<[; RECVMSG_MAX_NUM_CHUNKS]>
 }
 
 impl DeviceHandle {
@@ -235,12 +245,8 @@ impl DeviceHandle {
     fn event_loop(_i: usize, device: &Lock<Device>) {
         #[cfg(target_os = "linux")]
         let mut thread_local = ThreadData {
-            addrs: Vec::with_capacity(RECVMSG_NUM_CHUNKS),
-            iovec: Vec::with_capacity(RECVMSG_NUM_CHUNKS),
-            msghdrs: Vec::with_capacity(RECVMSG_NUM_CHUNKS),
-            // FIXME: can we not use the stack? segfaults for MAX_UDP_SIZE * numchunks
-            src_buf: [0u8; RECVMSG_NUM_CHUNKS * SRCBUF_CHUNK_SIZE],
-            dst_buf: [0u8; MAX_UDP_SIZE],
+            src_buf: [0u8; BUF_LEN],
+            dst_buf: [0u8; BUF_LEN],
             iface: if _i == 0 || !device.read().config.use_multi_queue {
                 // For the first thread use the original iface
                 Arc::clone(&device.read().iface)
@@ -260,6 +266,7 @@ impl DeviceHandle {
 
                 iface_local
             },
+            header_buffers: MultiHeaders::preallocate(MMSG_MAX_NUM_CHUNKS, None),
         };
 
         #[cfg(not(target_os = "linux"))]
@@ -664,108 +671,78 @@ impl Device {
             udp.as_raw_fd(),
             Box::new(move |d, t| {
                 // Handler that handles anonymous packets over UDP
-                let mut iter = MAX_ITR;
                 let (private_key, public_key) = d.key_pair.as_ref().expect("Key not set");
 
                 let rate_limiter = d.rate_limiter.as_ref().unwrap();
 
-                let msghdrs = &mut t.msghdrs;
-                let addrs = &mut t.addrs;
-                let msg_iov = &mut t.iovec;
+                let mtu = d.mtu.load(Ordering::Relaxed);
 
-                msghdrs.clear();
-                addrs.clear();
-                msg_iov.clear();
+                let chunk_size = mtu;
+                let mut big_buf = t.src_buf;
 
-                // TODO: use nix recvmmsg. it does not alloc
+                // TODO: move this allocation into thread_local storage
+                let mut io_vecs = big_buf
+                    .chunks_exact_mut(chunk_size)
+                    .take(MMSG_MAX_NUM_CHUNKS)
+                    .map(IoSliceMut::new)
+                    .map(|slice| [slice])
+                    .collect::<Box<[[_; 1]]>>();
 
-                for buffer in t.src_buf.chunks_exact_mut(SRCBUF_CHUNK_SIZE) {
-                    //log::debug!("mtu {mtu}, buf size: {}", buffer.len());
+                // TODO: repeat call to recvmmsg, up to MAX_ITR times, until we read no packets.
+                // for _ in 0..MAX_ITR {}
 
-                    addrs.push(unsafe { std::mem::zeroed() });
-                    let source: &mut libc::sockaddr_storage = addrs.last_mut().unwrap();
+                //log::info!("call recvmmsg");
+                let result = recvmmsg(
+                    (*udp).as_raw_fd(),
+                    &mut t.header_buffers,
+                    &mut io_vecs,
+                    MsgFlags::MSG_DONTWAIT,
+                    None,
+                );
 
-                    msg_iov.push(nix::libc::iovec {
-                        // TODO: is this safe?!?!? sure
-                        iov_base: buffer.as_mut_ptr() as *mut _,
-                        iov_len: buffer.len(),
-                    });
-                    //let mut msg_control = vec![0u8; 2048];
-
-                    let msg_header = nix::libc::msghdr {
-                        msg_name: source as *mut _ as *mut c_void,
-                        msg_namelen: size_of_val(source) as u32,
-                        msg_iov: msg_iov.last_mut().unwrap() as *mut _,
-                        msg_iovlen: 1,
-                        //msg_control: msg_control.as_mut_ptr() as *mut _,
-                        //msg_controllen: msg_control.len(),
-                        msg_control: null_mut(),
-                        msg_controllen: 0,
-                        msg_flags: 0,
-                    };
-                    let mmsg_header = nix::libc::mmsghdr {
-                        msg_hdr: msg_header,
-                        msg_len: 0,
-                    };
-
-                    msghdrs.push(mmsg_header);
-                }
-
-
-                //println!("recvmsg");
-                let number_of_messages = unsafe {
-                    recvmmsg(
-                        (*udp).as_raw_fd(),
-                        msghdrs.as_mut_ptr(),
-                        msghdrs.len() as u32,
-                        MSG_DONTWAIT,
-                        null_mut(),
-                    )
+                let reads = match result {
+                    Ok(n) => n,
+                    Err(e) => {
+                        log::error!("Failed to read on udp socket: {e}");
+                        return Action::Continue;
+                    }
                 };
 
-                if number_of_messages < 0 {
-                    let err = io::Error::last_os_error();
-                    eprintln!("Failedx to read on udp socket: {err}");
-                    return Action::Continue;
-                }
-                let number_of_messages = number_of_messages as usize;
+                //let mut n = 0;
+                for read in reads {
+                    //n += 1;
 
-                // FIXME: segfault
-
-                println!("number_of_messages: {number_of_messages}");
-                //log::info!("jdsaojaids");
-                for (header, packet) in msghdrs
-                    .iter()
-                    .take(number_of_messages)
-                    .zip(t.src_buf.chunks_exact(SRCBUF_CHUNK_SIZE))
-                {
-                    //log::debug!("MSG LEN: {}", header.msg_len);
-                    let packet = &packet[..header.msg_len as usize];
-
-                    let addr_in = unsafe { SockaddrStorage::from_raw(header.msg_hdr.msg_name as _, Some(header.msg_hdr.msg_namelen as u32)) }.unwrap();
-                    let addr = if let Some(addr) = addr_in.as_sockaddr_in() {
-                        SocketAddr::from(SocketAddrV4::from(*addr))
-                    } else if let Some(addr) = addr_in.as_sockaddr_in6() {
-                        SocketAddr::from(SocketAddrV6::from(*addr))
-                    } else {
-                        break;
+                    // We only allocate a single io vec per message.
+                    let Some(packet) = read.iovs().next() else {
+                        panic!("no data?!");
                     };
-                    //println!("receiving from {addr}");
 
-                    // FIXME: addr can be v6
+                    let Some(address) = read.address else {
+                        panic!("no address!?");
+                    };
 
-                    //println!("parsing packet");
+                    let address = if let Some(address) = address.as_sockaddr_in() {
+                        SocketAddr::from(SocketAddrV4::from(*address))
+                    } else if let Some(address) = address.as_sockaddr_in6() {
+                        SocketAddr::from(SocketAddrV6::from(*address))
+                    } else {
+                        panic!("what is this address!?!?");
+                    };
+                    //log::info!("receiving from {address}");
 
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
-                    let parsed_packet =
-                        match rate_limiter.verify_packet(Some(addr.ip()), packet, &mut t.dst_buf) {
-                            Ok(packet) => packet,
-                            Err(TunnResult::WriteToNetwork(cookie)) => {
-                                udp.sendto(cookie, addr);
-                                continue;
-                            }
-                            Err(_) => continue,
-                        };
+                    let parsed_packet = match rate_limiter.verify_packet(
+                        Some(address.ip()),
+                        packet,
+                        &mut t.dst_buf,
+                    ) {
+                        Ok(packet) => packet,
+                        Err(TunnResult::WriteToNetwork(cookie)) => {
+                            udp.sendto(cookie, address);
+                            continue;
+                        }
+                        Err(_) => continue,
+                    };
 
                     let peer = match &parsed_packet {
                         Packet::HandshakeInit(p) => {
@@ -780,8 +757,6 @@ impl Device {
                         Packet::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
                         Packet::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
                     };
-
-                    //println!("peer: {peer:?}");
 
                     let peer = match peer {
                         None => continue,
@@ -798,7 +773,7 @@ impl Device {
                         TunnResult::Err(_) => continue,
                         TunnResult::WriteToNetwork(packet) => {
                             flush = true;
-                            udp.sendto(packet, SocketAddr::from(addr));
+                            udp.sendto(packet, SocketAddr::from(address));
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
                             if peer.is_allowed_ip(addr) {
@@ -817,25 +792,22 @@ impl Device {
                         while let TunnResult::WriteToNetwork(packet) =
                             peer.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
                         {
-                            udp.sendto(packet, addr);
+                            udp.sendto(packet, address);
                         }
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
-                    let ip_addr = addr.ip();
-                    peer.set_endpoint(addr);
+                    let ip_addr = address.ip();
+                    peer.set_endpoint(address);
                     if d.config.use_connected_socket {
                         if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.fwmark) {
                             d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                                 .unwrap();
                         }
                     }
-
-                    iter -= 1;
-                    if iter == 0 {
-                        break;
-                    }
                 }
+
+                //log::info!("number_of_messages: {n}");
 
                 Action::Continue
 
@@ -934,6 +906,9 @@ impl Device {
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
+                // TODO: remove this when you've tested that this code works.
+                log::warn!("calling recvmmsg on a *connected* socket. ACHTUNG! UNTESTED!");
+
                 // The conn_handler handles packet received from a connected UDP socket, associated
                 // with a known peer, this saves us the hustle of finding the right peer. If another
                 // peer gets the same ip, it will be ignored until the socket does not expire.
@@ -942,77 +917,44 @@ impl Device {
 
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
-                let mut big_buf = vec![0u8; mtu * 10];
-                // let mut buffers = vec![vec![0u8; MAX_UDP_SIZE]; 10];
-                let mut msghdrs = vec![];
-
-                for buffer in big_buf.chunks_exact_mut(mtu) {
-                    log::debug!("mtu {mtu}, buf size: {}", buffer.len());
-
-                    // XXX: only works for ipv4
-                    let mut source: nix::libc::sockaddr_in = unsafe { std::mem::zeroed() };
-                    let mut msg_iov = vec![nix::libc::iovec {
-                        // TODO: is this safe?!?!? sure
-                        iov_base: buffer.as_mut_ptr() as *mut _,
-                        iov_len: buffer.len().min(mtu),
-                    }];
-                    //let mut msg_control = vec![0u8; 2048];
-
-                    let msg_header = nix::libc::msghdr {
-                        msg_name: &mut source as *mut _ as *mut c_void,
-                        msg_namelen: size_of_val(&source) as u32,
-                        msg_iov: msg_iov.as_mut_ptr() as *mut _,
-                        msg_iovlen: msg_iov.len(),
-                        //msg_control: msg_control.as_mut_ptr() as *mut _,
-                        //msg_controllen: msg_control.len(),
-                        msg_control: null_mut(),
-                        msg_controllen: 0,
-                        msg_flags: 0,
-                    };
-                    let mmsg_header = nix::libc::mmsghdr {
-                        msg_hdr: msg_header,
-                        msg_len: 0,
-                    };
-
-                    msghdrs.push(mmsg_header);
-                }
+                let chunk_size = mtu;
+                let mut big_buf = t.src_buf;
+                let chunk_count = t.src_buf.len() / chunk_size;
 
                 for _ in 0..MAX_ITR {
-                    log::info!("calling recvmmmsg");
+                    // TODO: move this allocation into thread_local storage
+                    let mut io_vecs = big_buf
+                        .chunks_exact_mut(chunk_size)
+                        .map(IoSliceMut::new)
+                        .map(|slice| [slice])
+                        .collect::<Box<[[_; 1]]>>();
 
-                    let number_of_messages = unsafe {
-                        recvmmsg(
-                            iface.as_raw_fd(),
-                            msghdrs.as_mut_ptr(),
-                            msghdrs.len() as u32,
-                            libc::MSG_DONTWAIT,
-                            null_mut(),
-                        )
+                    // TODO: move this allocation into thread_local storage
+                    let mut header_buffers =
+                        MultiHeaders::<SockaddrStorage>::preallocate(chunk_count, None);
+
+                    //log::info!("calling recvmmmsg");
+                    let result = recvmmsg(
+                        iface.as_raw_fd(),
+                        &mut header_buffers,
+                        &mut io_vecs,
+                        MsgFlags::MSG_DONTWAIT,
+                        None,
+                    );
+
+                    let reads = match result {
+                        Ok(n) => n,
+                        Err(e) => {
+                            log::error!("Failed to read on udp socket: {e}");
+                            return Action::Continue;
+                        }
                     };
 
-                    if number_of_messages < 0 {
-                        let err = io::Error::last_os_error();
-                        match err.kind() {
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => {
-                                log::debug!("would block");
-                                break;
-                            }
-                            _ => {
-                                eprintln!("Fatal read error on tun interface: {}", err);
-                                return Action::Exit;
-                            }
-                        }
-                    }
-                    let number_of_messages = number_of_messages as usize;
-
-                    log::info!("number_of_messages: {number_of_messages}");
-                    for (header, buf) in msghdrs
-                        .iter()
-                        .take(number_of_messages)
-                        .zip(big_buf.chunks_exact(mtu))
-                    {
-                        let n = header.msg_len as usize;
-                        let src = &buf[..n];
+                    for read in reads {
+                        // We only allocate a single io vec per message.
+                        let Some(src) = read.iovs().next() else {
+                            panic!("no data?!");
+                        };
 
                         let mut flush = false;
                         match peer
@@ -1046,44 +988,6 @@ impl Device {
                             }
                         }
                     }
-
-                    //while let Ok(src) = udp.read(&mut t.src_buf[..]) {
-                    // let mut flush = false;
-                    // match peer
-                    //     .tunnel
-                    //     .decapsulate(Some(peer_addr), src, &mut t.dst_buf[..])
-                    // {
-                    //     TunnResult::Done => {}
-                    //     TunnResult::Err(e) => eprintln!("Decapsulate error {:?}", e),
-                    //     TunnResult::WriteToNetwork(packet) => {
-                    //         flush = true;
-                    //         udp.write(packet);
-                    //     }
-                    //     TunnResult::WriteToTunnelV4(packet, addr) => {
-                    //         if peer.is_allowed_ip(addr) {
-                    //             iface.write4(packet);
-                    //         }
-                    //     }
-                    //     TunnResult::WriteToTunnelV6(packet, addr) => {
-                    //         if peer.is_allowed_ip(addr) {
-                    //             iface.write6(packet);
-                    //         }
-                    //     }
-                    // };
-
-                    // if flush {
-                    //     // Flush pending queue
-                    //     while let TunnResult::WriteToNetwork(packet) =
-                    //         peer.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
-                    //     {
-                    //         udp.write(packet);
-                    //     }
-                    // }
-
-                    // iter -= 1;
-                    // if iter == 0 {
-                    //     break;
-                    // }
                 }
                 Action::Continue
             }),
@@ -1160,46 +1064,4 @@ impl Device {
         )?;
         Ok(())
     }
-}
-
-fn fun_name(
-    src: &[u8],
-    peers: &AllowedIps<Arc<Peer>>,
-    t: &mut ThreadData,
-    udp4: &Arc<UDPSocket>,
-    udp6: &Arc<UDPSocket>,
-) -> ControlFlow<()> {
-    let dst_addr = match Tunn::dst_address(src) {
-        Some(addr) => addr,
-        None if cfg!(debug_assertions) => {
-            panic!("Got an invalid packet from the tunnel device. Is it incorrectly configured?");
-        }
-        None => return ControlFlow::Break(()),
-    };
-    let peer = match peers.find(dst_addr) {
-        Some(peer) => peer,
-        None => return ControlFlow::Break(()),
-    };
-    match peer.tunnel.encapsulate(src, &mut t.dst_buf[..]) {
-        TunnResult::Done => {}
-        TunnResult::Err(e) => {
-            tracing::error!(message = "Encapsulate error", error = ?e)
-        }
-        TunnResult::WriteToNetwork(packet) => {
-            let endpoint = peer.endpoint();
-            if let Some(ref conn) = endpoint.conn {
-                // Prefer to send using the connected socket
-                conn.write(packet);
-            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                udp4.sendto(packet, addr);
-            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                udp6.sendto(packet, addr);
-            } else {
-                tracing::error!("No endpoint");
-            }
-        }
-        _ => panic!("Unexpected result from encapsulate"),
-    };
-
-    ControlFlow::Continue(())
 }
