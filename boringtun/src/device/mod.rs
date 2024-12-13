@@ -31,8 +31,7 @@ pub mod udp;
 
 use core::panic;
 use std::collections::HashMap;
-use std::io;
-use std::io::IoSliceMut;
+use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,8 +44,9 @@ use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use allowed_ips::AllowedIps;
+use api::ConfigRx;
 use nix::sys::socket::{recvmmsg, MsgFlags, MultiHeaders, SockaddrStorage};
-use peer::{AllowedIP, Peer};
+use peer::{AllowedIp, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use tun::{errno, errno_str, TunSocket};
 use udp::UDPSocket;
@@ -108,15 +108,15 @@ pub struct DeviceHandle {
     threads: Vec<JoinHandle<()>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DeviceConfig {
     pub n_threads: usize,
     pub use_connected_socket: bool,
     #[cfg(target_os = "linux")]
     pub use_multi_queue: bool,
+
     #[cfg(target_os = "linux")]
-    pub uapi_fd: i32,
-    pub config_string: Option<String>,
+    pub api: Option<ConfigRx>,
 }
 
 impl Default for DeviceConfig {
@@ -127,8 +127,7 @@ impl Default for DeviceConfig {
             #[cfg(target_os = "linux")]
             use_multi_queue: true,
             #[cfg(target_os = "linux")]
-            uapi_fd: -1,
-            config_string: None,
+            api: None,
         }
     }
 }
@@ -152,16 +151,14 @@ pub struct Device {
     peers_by_idx: HashMap<u32, Arc<Peer>>,
     next_index: u32,
 
-    config: DeviceConfig,
+    use_multi_queue: bool,
+    use_connected_socket: bool,
 
     cleanup_paths: Vec<String>,
 
     mtu: AtomicUsize,
 
     rate_limiter: Option<Arc<RateLimiter>>,
-
-    #[cfg(target_os = "linux")]
-    uapi_fd: i32,
 }
 
 impl std::fmt::Debug for Device {
@@ -180,11 +177,9 @@ impl std::fmt::Debug for Device {
             //.field("peers_by_ip", &self.peers_by_ip)
             //.field("peers_by_idx", &self.peers_by_idx)
             .field("next_index", &self.next_index)
-            .field("config", &self.config)
             .field("cleanup_paths", &self.cleanup_paths)
             .field("mtu", &self.mtu)
             //.field("rate_limiter", &self.rate_limiter)
-            .field("uapi_fd", &self.uapi_fd)
             .finish()
     }
 }
@@ -201,7 +196,9 @@ struct ThreadData {
 }
 
 impl DeviceHandle {
-    pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
+    pub fn new(name: &str, mut config: DeviceConfig) -> Result<DeviceHandle, Error> {
+        let api = config.api.take(); // FIXME: this is shit
+
         let n_threads = config.n_threads;
         log::info!("creating device");
         let wg_interface: Device = Device::new(name, config)?;
@@ -212,6 +209,10 @@ impl DeviceHandle {
         //wg_interface.open_listen_socket(0)?; // Start listening on a random port
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
+
+        if let Some(channel) = api {
+            Device::register_api_handler(&interface_lock, channel);
+        }
 
         let mut threads: Vec<JoinHandle<()>> = vec![];
 
@@ -247,7 +248,7 @@ impl DeviceHandle {
         let mut thread_local = ThreadData {
             src_buf: [0u8; BUF_LEN],
             dst_buf: [0u8; BUF_LEN],
-            iface: if _i == 0 || !device.read().config.use_multi_queue {
+            iface: if _i == 0 || !device.read().use_multi_queue {
                 // For the first thread use the original iface
                 Arc::clone(&device.read().iface)
             } else {
@@ -276,11 +277,6 @@ impl DeviceHandle {
             iface: Arc::clone(&device.read().iface),
         };
 
-        #[cfg(not(target_os = "linux"))]
-        let uapi_fd = -1;
-        #[cfg(target_os = "linux")]
-        let uapi_fd = device.read().uapi_fd;
-
         loop {
             // The event loop keeps a read lock on the device, because we assume write access is rarely needed
             let mut device_lock = device.read();
@@ -300,10 +296,6 @@ impl DeviceHandle {
                         }
                     }
                     WaitResult::EoF(handler) => {
-                        if uapi_fd >= 0 && uapi_fd == handler.fd() {
-                            device_lock.trigger_exit();
-                            return;
-                        }
                         handler.cancel();
                     }
                     WaitResult::Error(e) => tracing::error!(message = "Poll error", error = ?e),
@@ -347,7 +339,7 @@ impl Device {
         remove: bool,
         _replace_ips: bool,
         endpoint: Option<SocketAddr>,
-        allowed_ips: &[AllowedIP],
+        allowed_ips: &[AllowedIp],
         keepalive: Option<u16>,
         preshared_key: Option<[u8; 32]>,
     ) {
@@ -384,12 +376,12 @@ impl Device {
         self.peers.insert(pub_key, Arc::clone(&peer));
         self.peers_by_idx.insert(next_index, Arc::clone(&peer));
 
-        for AllowedIP { addr, cidr } in allowed_ips {
+        for AllowedIp { addr, cidr } in allowed_ips {
             self.peers_by_ip
                 .insert(*addr, *cidr as _, Arc::clone(&peer));
         }
 
-        tracing::info!("Peer added");
+        log::info!("Peer added");
     }
 
     pub fn new(name: &str, config: DeviceConfig) -> Result<Device, Error> {
@@ -405,15 +397,11 @@ impl Device {
         log::info!("setting MTU");
         let mtu = iface.mtu()?;
 
-        #[cfg(not(target_os = "linux"))]
-        let uapi_fd = -1;
-        #[cfg(target_os = "linux")]
-        let uapi_fd = config.uapi_fd;
-
         let mut device = Device {
             queue: Arc::new(poll),
             iface,
-            config: config.clone(),
+            use_multi_queue: config.use_multi_queue,
+            use_connected_socket: config.use_connected_socket,
             exit_notice: Default::default(),
             yield_notice: Default::default(),
             fwmark: Default::default(),
@@ -428,22 +416,8 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
-            #[cfg(target_os = "linux")]
-            uapi_fd,
         };
 
-        if let Some(config_string) = &config.config_string {
-            device.read_config_string(config_string)?;
-        } else {
-            panic!();
-        }
-        // } else if uapi_fd >= 0 {
-        //     log::info!("registering uapi handler");
-        //     device.register_api_fd(uapi_fd)?;
-        // } else {
-        //     log::info!("registering iface handler");
-        //     device.register_api_handler()?;
-        // }
         log::info!("register_iface_handler");
         device.register_iface_handler(Arc::clone(&device.iface))?;
         log::info!("register_notifiers");
@@ -799,7 +773,7 @@ impl Device {
                     // This packet was OK, that means we want to create a connected socket for this peer
                     let ip_addr = address.ip();
                     peer.set_endpoint(address);
-                    if d.config.use_connected_socket {
+                    if d.use_connected_socket {
                         if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.fwmark) {
                             d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                                 .unwrap();

@@ -86,8 +86,6 @@ fn main() {
         .get_matches();
 
     let background = !matches.is_present("foreground");
-    #[cfg(target_os = "linux")]
-    let uapi_fd: i32 = matches.value_of_t("uapi-fd").unwrap_or_else(|e| e.exit());
     let tun_fd: isize = matches.value_of_t("tun-fd").unwrap_or_else(|e| e.exit());
     let mut tun_name = matches.value_of("INTERFACE_NAME").unwrap();
     if tun_fd >= 0 {
@@ -150,11 +148,10 @@ fn main() {
     let config = DeviceConfig {
         n_threads,
         #[cfg(target_os = "linux")]
-        uapi_fd,
+        api: None,
         use_connected_socket: !matches.is_present("disable-connected-udp"),
         #[cfg(target_os = "linux")]
         use_multi_queue: !matches.is_present("disable-multi-queue"),
-        config_string: None,
     };
 
     let mut device_handle: DeviceHandle = match DeviceHandle::new(tun_name, config) {

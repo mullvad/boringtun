@@ -1,7 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use crate::device::peer::AllowedIP;
+use crate::device::peer::AllowedIp;
 
 use ip_network::IpNetwork;
 use ip_network_table::IpNetworkTable;
@@ -16,8 +16,8 @@ pub struct AllowedIps<D> {
     ips: IpNetworkTable<D>,
 }
 
-impl<'a, D> FromIterator<(&'a AllowedIP, D)> for AllowedIps<D> {
-    fn from_iter<I: IntoIterator<Item = (&'a AllowedIP, D)>>(iter: I) -> Self {
+impl<'a, D> FromIterator<(&'a AllowedIp, D)> for AllowedIps<D> {
+    fn from_iter<I: IntoIterator<Item = (&'a AllowedIp, D)>>(iter: I) -> Self {
         let mut allowed_ips = AllowedIps::new();
 
         for (ip, data) in iter {

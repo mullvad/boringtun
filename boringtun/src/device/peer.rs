@@ -40,12 +40,12 @@ impl std::fmt::Debug for Peer {
 }
 
 #[derive(Debug)]
-pub struct AllowedIP {
+pub struct AllowedIp {
     pub addr: IpAddr,
     pub cidr: u8,
 }
 
-impl FromStr for AllowedIP {
+impl FromStr for AllowedIp {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -56,8 +56,8 @@ impl FromStr for AllowedIP {
 
         let (addr, cidr) = (ip[0].parse::<IpAddr>(), ip[1].parse::<u8>());
         match (addr, cidr) {
-            (Ok(addr @ IpAddr::V4(_)), Ok(cidr)) if cidr <= 32 => Ok(AllowedIP { addr, cidr }),
-            (Ok(addr @ IpAddr::V6(_)), Ok(cidr)) if cidr <= 128 => Ok(AllowedIP { addr, cidr }),
+            (Ok(addr @ IpAddr::V4(_)), Ok(cidr)) if cidr <= 32 => Ok(AllowedIp { addr, cidr }),
+            (Ok(addr @ IpAddr::V6(_)), Ok(cidr)) if cidr <= 128 => Ok(AllowedIp { addr, cidr }),
             _ => Err("Invalid IP format".to_owned()),
         }
     }
@@ -68,7 +68,7 @@ impl Peer {
         tunnel: Box<Tunn>,
         index: u32,
         endpoint: Option<SocketAddr>,
-        allowed_ips: &[AllowedIP],
+        allowed_ips: &[AllowedIp],
         preshared_key: Option<[u8; 32]>,
     ) -> Peer {
         Peer {
@@ -157,8 +157,10 @@ impl Peer {
         self.allowed_ips.find(addr.into()).is_some()
     }
 
-    pub fn allowed_ips(&self) -> impl Iterator<Item = (IpAddr, u8)> + '_ {
-        self.allowed_ips.iter().map(|(_, ip, cidr)| (ip, cidr))
+    pub fn allowed_ips(&self) -> impl Iterator<Item = AllowedIp> + '_ {
+        self.allowed_ips
+            .iter()
+            .map(|(_, addr, cidr)| AllowedIp { addr, cidr })
     }
 
     pub fn time_since_last_handshake(&self) -> Option<std::time::Duration> {
