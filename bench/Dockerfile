@@ -25,4 +25,4 @@ RUN git clone -b bench https://github.com/mullvad/boringtun.git && cd boringtun 
 COPY init.sh /
 
 ENTRYPOINT ["/bin/bash", "/init.sh"]
-CMD /usr/bin/env tail -f /dev/null
+CMD /usr/bin/env bash
