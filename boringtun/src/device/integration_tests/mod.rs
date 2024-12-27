@@ -270,7 +270,6 @@ mod tests {
                     use_multi_queue: true,
                     #[cfg(target_os = "linux")]
                     api: None,
-                    config_string: None,
                 },
             )
         }
@@ -563,7 +562,6 @@ mod tests {
                 use_multi_queue: true,
                 #[cfg(target_os = "linux")]
                 api: None,
-                config_string: None,
             },
         );
 
@@ -722,7 +720,6 @@ mod tests {
                 use_multi_queue: true,
                 #[cfg(target_os = "linux")]
                 api: None,
-                config_string: None,
             },
         );
 

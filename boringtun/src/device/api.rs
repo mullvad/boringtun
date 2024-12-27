@@ -15,6 +15,7 @@ use libc::*;
 use std::fmt::Debug;
 use std::fs::create_dir;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixListener;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
@@ -41,44 +42,26 @@ impl ConfigTx {
     }
 }
 
-impl ConfigRx {
-    pub fn new() -> (ConfigTx, ConfigRx) {
-        let (tx, rx) = mpsc::channel();
-
-        (ConfigTx { tx }, ConfigRx { rx })
-    }
-
-    pub fn from_read_write<RW>(rw: RW) -> Self
+impl ConfigTx {
+    /// Wrap a [Read] + [Write] and spawn a thread to convert between the textual config format and
+    /// [Request]/[Response].
+    pub fn wrap_read_write<RW>(self, rw: RW)
     where
+        for<'a> &'a RW: Read + Write,
         RW: Send + Sync + 'static,
-        Arc<RW>: Read + Write,
     {
-        let rw = Arc::new(rw);
-        Self::from_read_and_write(rw.clone(), rw.clone())
-    }
-
-    pub fn from_read_and_write(
-        r: impl Read + Send + 'static,
-        mut w: impl Write + Send + 'static,
-    ) -> Self {
-        let (request_tx, request_rx) = mpsc::channel();
-
-        let r = BufReader::new(r);
         std::thread::spawn(move || {
-            let mut make_request = |s: &str| {
+            let r = BufReader::new(&rw);
+
+            let make_request = |s: &str| {
                 let request = Request::from_str(s).wrap_err("Failed to parse command")?;
 
-                let (response_tx, response_rx) = mpsc::channel();
-
-                let Some(response) = request_tx
-                    .send((request, response_tx))
-                    .ok()
-                    .and_then(|_| response_rx.recv().ok())
-                else {
+                let Some(response) = self.send(request).ok() else {
                     bail!("Server hung up");
                 };
 
-                if let Err(e) = writeln!(w, "{response}") {
+                log::info!("{:?}", response.to_string());
+                if let Err(e) = writeln!(&rw, "{response}") {
                     log::error!("Failed to write API response: {e}");
                 };
 
@@ -88,13 +71,19 @@ impl ConfigRx {
             let mut lines = String::new();
 
             for line in r.lines() {
+                dbg!(&line);
                 let Ok(line) = line else {
                     if !lines.is_empty() {
-                        make_request(&lines).unwrap();
+                        if let Err(e) = make_request(&lines) {
+                            log::error!("Failed to handle UAPI request: {e:#}");
+                            return;
+                        };
                     }
                     return;
                 };
 
+                // Final line of a command is empty, so if this one is not, we add it to the
+                // `lines` buffer and wait for more.
                 if !line.is_empty() {
                     lines.push_str(&line);
                     lines.push('\n');
@@ -105,11 +94,92 @@ impl ConfigRx {
                     continue;
                 }
 
-                make_request(&lines).unwrap();
+                if let Err(e) = make_request(&lines) {
+                    log::error!("Failed to handle UAPI request: {e:#}");
+                    return;
+                };
+
+                lines.clear();
             }
         });
+    }
+}
 
-        Self { rx: request_rx }
+impl ConfigRx {
+    pub fn new() -> (ConfigTx, ConfigRx) {
+        let (tx, rx) = mpsc::channel();
+
+        (ConfigTx { tx }, ConfigRx { rx })
+    }
+
+    pub fn default_unix_socket(interface_name: &str) -> anyhow::Result<Self> {
+        let path = format!("{SOCK_DIR}/{interface_name}.sock");
+
+        create_sock_dir();
+
+        let _ = std::fs::remove_file(&path); // Attempt to remove the socket if already exists
+
+        // Bind a new socket to the path
+        let api_listener =
+            UnixListener::bind(&path).map_err(|e| anyhow!("Failed to bidd unix socket: {e}"))?;
+
+        let (tx, rx) = ConfigRx::new();
+
+        std::thread::spawn(move || loop {
+            let Ok((stream, _)) = api_listener.accept() else {
+                break;
+            };
+
+            log::info!("New UAPI connection on unix socket");
+
+            tx.clone().wrap_read_write(stream);
+        });
+
+        Ok(rx)
+
+        //self.cleanup_paths.push(path.clone());
+
+        /*
+        self.queue.new_event(
+            api_listener.as_raw_fd(),
+            Box::new(move |d, _| {
+                // This is the closure that listens on the api unix socket
+                let (api_conn, _) = match api_listener.accept() {
+                    Ok(conn) => conn,
+                    _ => return Action::Continue,
+                };
+
+                let mut reader = BufReader::new(&api_conn);
+                let mut writer = BufWriter::new(&api_conn);
+                let mut cmd = String::new();
+                if reader.read_line(&mut cmd).is_ok() {
+                    cmd.pop(); // pop the new line character
+                    let status = match cmd.as_ref() {
+                        // Only two commands are legal according to the protocol, get=1 and set=1.
+                        "get=1" => api_get(&mut writer, d),
+                        "set=1" => api_set(&mut reader, d),
+                        _ => EIO,
+                    };
+                    // The protocol requires to return an error code as the response, or zero on success
+                    writeln!(writer, "errno={}\n", status).ok();
+                }
+                Action::Continue // Indicates the worker thread should continue as normal
+            }),
+        )?;
+
+        self.register_monitor(path)?;
+        self.register_api_signal_handlers()
+        */
+    }
+
+    pub fn from_read_write<RW>(rw: RW) -> Self
+    where
+        RW: Send + Sync + 'static,
+        for<'a> &'a RW: Read + Write,
+    {
+        let (tx, rx) = Self::new();
+        tx.wrap_read_write(rw);
+        rx
     }
 
     pub fn recv(&mut self) -> Option<(Request, impl FnOnce(Response))> {
@@ -302,10 +372,11 @@ fn api_get(_: Get, d: &Device) -> GetResponse {
         .collect();
 
     GetResponse {
-        private_key: d.key_pair.as_ref().map(|k| KeyBytes(k.1.to_bytes())),
+        private_key: d.key_pair.as_ref().map(|k| KeyBytes(k.0.to_bytes())),
         listen_port: Some(d.listen_port),
         fwmark: d.fwmark,
         peers,
+        errno: 0,
     }
 }
 

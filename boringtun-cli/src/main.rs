@@ -1,6 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+use boringtun::device::api::ConfigRx;
 use boringtun::device::drop_privileges::drop_privileges;
 use boringtun::device::{DeviceConfig, DeviceHandle};
 use clap::{Arg, Command};
@@ -148,7 +149,7 @@ fn main() {
     let config = DeviceConfig {
         n_threads,
         #[cfg(target_os = "linux")]
-        api: None,
+        api: Some(ConfigRx::default_unix_socket(tun_name).expect("Failed to create UAPI socket")),
         use_connected_socket: !matches.is_present("disable-connected-udp"),
         #[cfg(target_os = "linux")]
         use_multi_queue: !matches.is_present("disable-multi-queue"),

@@ -67,6 +67,8 @@ pub struct GetResponse {
 
     #[builder(default, setter(skip))]
     pub peers: Vec<GetPeer>,
+
+    pub errno: i32,
 }
 
 #[derive(TypedBuilder, Default)]
@@ -242,6 +244,7 @@ impl Display for GetResponse {
             listen_port,
             fwmark,
             peers,
+            errno,
         } = self;
 
         let fields = [
@@ -258,10 +261,12 @@ impl Display for GetResponse {
 
         for peer in peers {
             // TODO: make sure number of newlines is correct.
-            writeln!(f, "{peer}")?;
+            write!(f, "{peer}")?;
         }
 
-        todo!()
+        writeln!(f, "errno={errno}")?;
+
+        Ok(())
     }
 }
 
@@ -480,10 +485,10 @@ impl FromStr for Request {
     type Err = eyre::Report;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
+        //let s = s.trim();
 
         let Some((first_line, ..)) = s.split_once('\n') else {
-            bail!("Missing newline");
+            bail!("Missing newline: {s:?}");
         };
 
         Ok(match first_line {
@@ -506,6 +511,7 @@ fn testy() {
     let _get = GetResponse::builder()
         .fwmark(123u32)
         .listen_port(18u16)
+        .errno(0)
         .build()
         .peer(get);
 
