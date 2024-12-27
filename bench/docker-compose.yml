@@ -18,8 +18,6 @@ services:
       PEER_PUBLIC_KEY: YHaorospSrSyOxfRudEGp7x7wCQXUrBpEQVG/9D7LVo=
       WG_PORT: 51820
       WIREGUARD_CMD: boringtun-cli
-    volumes:
-      - ./data/wireguard-server/config:/config
     ports:
       - "51820:51820/udp"  # Expose WireGuard port (UDP)
     networks:
@@ -48,8 +46,6 @@ services:
       PEER_PUBLIC_KEY: mzuCe56dmasLJe1GDKmbCAg54XesBsB1cNcVhZijJys=
       WG_PORT: 51820
       WIREGUARD_CMD: boringtun-cli
-    volumes:
-      - ./data/wireguard-client/config:/config
     networks:
       - wireguard-network
     devices:
