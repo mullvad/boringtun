@@ -61,7 +61,6 @@ services:
     restart: unless-stopped
     command: iperf3 -c 10.13.13.1 # Run iperf3 in client mode, connecting to wireguard-server via wireguard
 
-
 networks:
   wireguard-network:
     driver: bridge
