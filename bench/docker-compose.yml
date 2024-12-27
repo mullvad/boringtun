@@ -29,7 +29,7 @@ services:
     cap_add:
       - NET_ADMIN  # Required for WireGuard to function
     restart: unless-stopped
-    command: iperf3 -s
+    command: iperf3 -s # Run iperf3 in server mode
 
   wireguard-client:
     image: benchy-boring
@@ -59,7 +59,7 @@ services:
     depends_on:
       - wireguard-server
     restart: unless-stopped
-    command: iperf3 -c 10.13.13.1
+    command: iperf3 -c 10.13.13.1 # Run iperf3 in client mode, connecting to wireguard-server via wireguard
 
 
 networks:
