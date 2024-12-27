@@ -3,19 +3,21 @@ version: '3.8'
 services:
   wireguard-server:
     image: benchy-boring
+    build: .
     container_name: wireguard-server
     environment:
-      - PUID=1000
-      - PGID=1000
-      - SERVERURL=localhost
-      - SERVERPORT=51820
-      - INTERNAL_SUBNET=10.13.13.0
+      PUID: 1000
+      PGID: 1000
+      SERVERURL: localhost
+      SERVERPORT: 51820
+      INTERNAL_SUBNET: 10.13.13.0
 
-      - ADDRESS=10.13.13.1/32
-      - ALLOWED_IPS=10.13.13.2/32
-      - PRIVATE_KEY=4Fk39U6nvoy/0mB2SwUCruUgPwdnwQKPmy5Vc5iUQ3U=
-      - PEER_PUBLIC_KEY=YHaorospSrSyOxfRudEGp7x7wCQXUrBpEQVG/9D7LVo=
-      - WG_PORT=51820
+      ADDRESS: 10.13.13.1/32
+      ALLOWED_IPS: 10.13.13.2/32
+      PRIVATE_KEY: 4Fk39U6nvoy/0mB2SwUCruUgPwdnwQKPmy5Vc5iUQ3U=
+      PEER_PUBLIC_KEY: YHaorospSrSyOxfRudEGp7x7wCQXUrBpEQVG/9D7LVo=
+      WG_PORT: 51820
+      WIREGUARD_CMD: boringtun-cli
     volumes:
       - ./data/wireguard-server/config:/config
     ports:
@@ -27,22 +29,25 @@ services:
     cap_add:
       - NET_ADMIN  # Required for WireGuard to function
     restart: unless-stopped
+    command: iperf3 -s
 
   wireguard-client:
     image: benchy-boring
+    build: .
     container_name: wireguard-client
     environment:
-      - PUID=1000
-      - PGID=1000
-      - SERVERURL=10.13.13.1  # Container name will be used as DNS
-      - WG_QUICK_USERSPACE_IMPLEMENTATION=/bin/wireguard
+      PUID: 1000
+      PGID: 1000
+      SERVERURL: 10.13.13.1  # Container name will be used as DNS
+      WG_QUICK_USERSPACE_IMPLEMENTATION: /bin/wireguard
 
-      - ADDRESS=10.13.13.2/32
-      - ALLOWED_IPS=10.13.13.1/32
-      - PRIVATE_KEY=OH8n76b67BAnh2vJf7WgT9yTgg6dwQsG+7yStTiDgVg=
-      - ENDPOINT=wireguard-server:51820  # Use container name as the DNS name in Docker
-      - PEER_PUBLIC_KEY=mzuCe56dmasLJe1GDKmbCAg54XesBsB1cNcVhZijJys=
-      - WG_PORT=51820
+      ADDRESS: 10.13.13.2/32
+      ALLOWED_IPS: 10.13.13.1/32
+      PRIVATE_KEY: OH8n76b67BAnh2vJf7WgT9yTgg6dwQsG+7yStTiDgVg=
+      ENDPOINT: wireguard-server:51820  # Use container name as the DNS name in Docker
+      PEER_PUBLIC_KEY: mzuCe56dmasLJe1GDKmbCAg54XesBsB1cNcVhZijJys=
+      WG_PORT: 51820
+      WIREGUARD_CMD: boringtun-cli
     volumes:
       - ./data/wireguard-client/config:/config
     networks:
@@ -54,6 +59,8 @@ services:
     depends_on:
       - wireguard-server
     restart: unless-stopped
+    command: iperf3 -c 10.13.13.1
+
 
 networks:
   wireguard-network:

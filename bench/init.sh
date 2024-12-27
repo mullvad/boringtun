@@ -21,7 +21,7 @@ EOF
 # Assume that the userspace implementation is called 'wireguard' and is placed in PATH
 #wireguard -f wg0 &
 #PID=$!
-WG_SUDO=1 wireguard wg0
+WG_SUDO=1 "${WIREGUARD_CMD:-wireguard}" wg0
 
 ip a add dev wg0 $ADDRESS
 ip l set dev wg0 up
@@ -30,4 +30,4 @@ ip r add dev wg0 $ALLOWED_IPS
 wg setconf wg0 wg0.conf
 
 #wait $PID
-tail -f /dev/null
+"$@"
