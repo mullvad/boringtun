@@ -15,6 +15,7 @@ edition = "2021"
 [features]
 jni-bindings = ["ffi-bindings", "jni"]
 ffi-bindings = []
+log = ["tracing/log", "tracing/log-always"]
 
 [dependencies]
 base64 = "0.13"
