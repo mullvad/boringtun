@@ -188,7 +188,7 @@ impl<R: RngCore + Send> Tunn<R> {
         self.handshake.set_preshared_key(preshared_key);
     }
 
-    /// Borrow the current preshared key without creating another secret copy.
+    /// Borrow the current preshared key.
     pub fn preshared_key(&self) -> Option<&PresharedKey> {
         self.handshake.preshared_key()
     }

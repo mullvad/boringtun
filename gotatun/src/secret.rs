@@ -10,18 +10,21 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::fmt;
+use std::sync::Arc;
 
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Fixed-size secret storage kept behind a stable heap allocation, so moving
-/// an owner moves only the pointer rather than copying the key bytes. The outer
-/// drop clears eagerly and `Zeroizing` remains the final drop guard.
-pub(crate) struct SecretBytes32(Box<Zeroizing<[u8; 32]>>);
+/// or cloning an owner does not copy the key bytes.
+#[derive(Clone)]
+pub(crate) struct SecretBytes32(Arc<Zeroizing<[u8; 32]>>);
 
 impl SecretBytes32 {
     pub(crate) fn from_bytes_ref(bytes: &[u8; 32]) -> Self {
         let mut secret = Self::zeroed();
-        secret.0.as_mut().copy_from_slice(bytes);
+        Arc::get_mut(&mut secret.0)
+            .expect("new secret is not shared")
+            .copy_from_slice(bytes);
         secret
     }
 
@@ -36,36 +39,20 @@ impl SecretBytes32 {
     }
 
     fn zeroed() -> Self {
-        Self(Box::new(Zeroizing::new([0u8; 32])))
-    }
-
-    fn zeroize(&mut self) {
-        self.0.as_mut().zeroize();
+        Self(Arc::new(Zeroizing::new([0u8; 32])))
     }
 }
-
-impl Clone for SecretBytes32 {
-    fn clone(&self) -> Self {
-        Self::from_bytes_ref(self.as_bytes())
-    }
-}
-
-impl Drop for SecretBytes32 {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
-}
-
-impl ZeroizeOnDrop for SecretBytes32 {}
 
 /// WireGuard preshared key material.
 ///
 /// This type owns PSK bytes as secret material: it is non-`Copy`, redacts
-/// `Debug`, and zeroizes its backing storage on drop. Raw byte arrays should
-/// only be used at explicit import/export boundaries or borrowed for crypto.
-/// Cloning creates an independent zeroizing allocation; replacing or dropping
-/// one value does not revoke any clones. Caller-owned buffers, compiler-created
-/// temporaries, registers, and allocator history are outside this guarantee.
+/// `Debug`, and shares its backing storage when cloned. The storage is zeroized
+/// when the last owner is dropped; replacing or dropping one value does not
+/// revoke other clones. Raw byte arrays should only be used at explicit
+/// import/export boundaries or borrowed for crypto. Caller-owned buffers,
+/// compiler-created temporaries, registers, and allocator history are outside
+/// this guarantee.
+#[derive(Clone)]
 pub struct PresharedKey(SecretBytes32);
 
 impl PresharedKey {
@@ -104,19 +91,11 @@ impl PresharedKey {
     }
 }
 
-impl Clone for PresharedKey {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
 impl fmt::Debug for PresharedKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("PresharedKey").field(&"<redacted>").finish()
     }
 }
-
-impl ZeroizeOnDrop for PresharedKey {}
 
 impl From<[u8; 32]> for PresharedKey {
     fn from(mut bytes: [u8; 32]) -> Self {
@@ -126,16 +105,7 @@ impl From<[u8; 32]> for PresharedKey {
 
 #[cfg(test)]
 mod tests {
-    use zeroize::ZeroizeOnDrop;
-
     use super::PresharedKey;
-
-    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
-
-    #[test]
-    fn implements_zeroize_on_drop() {
-        assert_zeroize_on_drop::<PresharedKey>();
-    }
 
     #[test]
     fn take_from_clears_source() {
@@ -147,12 +117,15 @@ mod tests {
     }
 
     #[test]
-    fn clone_uses_independent_storage() {
+    fn clone_shares_storage() {
         let key = PresharedKey::new([0xA5; 32]);
         let clone = key.clone();
 
         assert_eq!(clone.as_bytes(), key.as_bytes());
-        assert_ne!(clone.as_bytes().as_ptr(), key.as_bytes().as_ptr());
+        assert_eq!(clone.as_bytes().as_ptr(), key.as_bytes().as_ptr());
+
+        drop(key);
+        assert_eq!(clone.as_bytes(), &[0xA5; 32]);
     }
 
     #[test]

@@ -20,8 +20,6 @@ use crate::device::daita::DaitaSettings;
 use crate::noise::TimerParams;
 
 /// Peer data. Used to construct and update peers in a [`Device`](crate::device::Device).
-///
-/// Cloning a peer also clones its PSK into an independent zeroizing allocation.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Peer {
@@ -85,14 +83,9 @@ impl Peer {
         self
     }
 
-    /// Copy a preshared key into zeroizing storage for this peer.
-    ///
-    /// The function's local array is cleared, but `[u8; 32]` is [`Copy`], so a
-    /// copy retained by the caller is unaffected. Assign a
-    /// [`PresharedKey::take_from`] result to [`Self::preshared_key`] when the
-    /// caller's source array must also be cleared.
-    pub fn with_preshared_key(mut self, mut preshared_key: [u8; 32]) -> Self {
-        self.preshared_key = Some(PresharedKey::take_from(&mut preshared_key));
+    /// Set the preshared key for this peer.
+    pub fn with_preshared_key(mut self, preshared_key: impl Into<PresharedKey>) -> Self {
+        self.preshared_key = Some(preshared_key.into());
         self
     }
 

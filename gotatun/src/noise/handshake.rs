@@ -537,7 +537,7 @@ impl Handshake {
         self.params.set_preshared_key(preshared_key);
     }
 
-    /// Borrow the configured preshared key without creating another secret copy.
+    /// Borrow the configured preshared key.
     pub(crate) fn preshared_key(&self) -> Option<&PresharedKey> {
         self.params.preshared_key()
     }
