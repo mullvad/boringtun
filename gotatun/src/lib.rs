@@ -24,10 +24,13 @@ mod crypto;
 pub mod device;
 pub mod noise;
 pub mod packet;
+mod secret;
 pub mod tun;
 pub mod udp;
 
 mod task;
+
+pub use secret::PresharedKey;
 
 #[cfg(not(feature = "mock_instant"))]
 pub(crate) mod sleepyinstant;

@@ -27,6 +27,7 @@ mod timers;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use zerocopy::IntoBytes;
 
+use crate::PresharedKey;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::index_table::IndexTable;
@@ -93,7 +94,7 @@ impl Tunn<StdRng> {
     pub fn new(
         static_private: x25519::StaticSecret,
         peer_static_public: x25519::PublicKey,
-        preshared_key: Option<[u8; 32]>,
+        preshared_key: Option<PresharedKey>,
         persistent_keepalive: Option<u16>,
         index_table: IndexTable,
         rate_limiter: Arc<RateLimiter>,
@@ -115,7 +116,7 @@ impl<R: RngCore + Send> Tunn<R> {
     pub fn new_with_rng(
         static_private: x25519::StaticSecret,
         peer_static_public: x25519::PublicKey,
-        preshared_key: Option<[u8; 32]>,
+        preshared_key: Option<PresharedKey>,
         persistent_keepalive: Option<u16>,
         index_table: IndexTable,
         rate_limiter: Arc<RateLimiter>,
@@ -175,19 +176,20 @@ impl<R: RngCore + Send> Tunn<R> {
         }
     }
 
-    /// Update the preshared key used for future handshakes.
+    /// Replace the preshared key used when a handshake next reaches PSK mixing.
     ///
-    /// The new key is only mixed in by subsequent handshakes. The current
-    /// session therefore keeps working until it is rekeyed, so changing
-    /// the key does not interrupt traffic.
-    // Not invalidating current sessions matches the Linux kernel, which update
-    // the key in place and never tear down the session on a configuration change.
-    pub fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+    /// `None` selects WireGuard's all-zero no-PSK input. This method does not
+    /// invalidate established transport sessions. An in-flight handshake reads
+    /// the configured key when it reaches PSK mixing and can fail if its peer
+    /// generated a message using the previous key.
+    // This matches the Linux kernel's in-place update behavior: established
+    // sessions are not torn down by a PSK configuration change.
+    pub fn set_preshared_key(&mut self, preshared_key: Option<PresharedKey>) {
         self.handshake.set_preshared_key(preshared_key);
     }
 
-    /// Get the current preshared key.
-    pub fn preshared_key(&self) -> Option<[u8; 32]> {
+    /// Borrow the current preshared key.
+    pub fn preshared_key(&self) -> Option<&PresharedKey> {
         self.handshake.preshared_key()
     }
 
@@ -878,19 +880,17 @@ mod tests {
         assert_packet_roundtrip(&mut my_tun, &mut their_tun);
     }
 
-    /// Changing the preshared key only affects the next session, never the
-    /// current one. The PSK is not part of the established session's transport
-    /// keys, so traffic keeps flowing even though `their_tun` never learned the
-    /// new key. The next handshake does mix it in, so a one-sided change makes
-    /// the rekey fail to authenticate.
+    /// Changing the PSK does not alter the keys of an already established
+    /// transport session. A subsequent rekey uses the newly configured PSK, so
+    /// a one-sided change makes that handshake fail to authenticate.
     #[test]
-    fn set_preshared_key_only_affects_next_session() {
+    fn set_preshared_key_does_not_invalidate_established_session() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
 
         // Only one side adopts a new key.
-        my_tun.set_preshared_key(Some([7; 32]));
+        my_tun.set_preshared_key(Some([7; 32].into()));
 
-        // The established session is unaffected and keeps working.
+        // The PSK update did not invalidate this established session.
         assert_packet_roundtrip(&mut my_tun, &mut their_tun);
 
         // A second handshake needs a strictly newer timestamp than the first.
@@ -902,6 +902,30 @@ mod tests {
         assert!(
             matches!(result, TunnResult::Err(WireGuardError::InvalidAeadTag)),
             "expected the rekey to fail on the diverged PSK, got {result:?}"
+        );
+
+        // A failed rekey does not discard the established transport session.
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+    }
+
+    /// Updating the PSK takes effect immediately for an in-flight initiator
+    /// when it later processes the response's PSK mixing step.
+    #[test]
+    fn set_preshared_key_affects_in_flight_handshake() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        my_tun.set_preshared_key(Some([7; 32].into()));
+        their_tun.set_preshared_key(Some([7; 32].into()));
+
+        let init = create_handshake_init(&mut my_tun);
+        let response = create_handshake_response(&mut their_tun, init);
+
+        // The response was generated with the old PSK, but the initiator uses
+        // the newly configured PSK when it processes that response.
+        my_tun.set_preshared_key(Some([4; 32].into()));
+        let result = my_tun.handle_incoming_packet(WgKind::HandshakeResp(response));
+        assert!(
+            matches!(result, TunnResult::Err(WireGuardError::InvalidAeadTag)),
+            "expected the in-flight handshake to fail after PSK rotation, got {result:?}"
         );
     }
 
@@ -921,8 +945,8 @@ mod tests {
     #[test]
     fn handshake_completes_with_matching_preshared_key() {
         let (mut my_tun, mut their_tun) = create_two_tuns();
-        my_tun.set_preshared_key(Some([7; 32]));
-        their_tun.set_preshared_key(Some([7; 32]));
+        my_tun.set_preshared_key(Some([7; 32].into()));
+        their_tun.set_preshared_key(Some([7; 32].into()));
         complete_handshake(&mut my_tun, &mut their_tun);
     }
 
@@ -930,7 +954,7 @@ mod tests {
     #[test]
     fn handshake_fails_with_one_sided_preshared_key() {
         let (mut my_tun, mut their_tun) = create_two_tuns();
-        my_tun.set_preshared_key(Some([7; 32]));
+        my_tun.set_preshared_key(Some([7; 32].into()));
         let result = try_handshake(&mut my_tun, &mut their_tun);
         assert!(
             matches!(result, TunnResult::Err(WireGuardError::InvalidAeadTag)),
@@ -942,8 +966,8 @@ mod tests {
     #[test]
     fn handshake_fails_with_different_preshared_key() {
         let (mut my_tun, mut their_tun) = create_two_tuns();
-        my_tun.set_preshared_key(Some([7; 32]));
-        their_tun.set_preshared_key(Some([4; 32]));
+        my_tun.set_preshared_key(Some([7; 32].into()));
+        their_tun.set_preshared_key(Some([4; 32].into()));
         let result = try_handshake(&mut my_tun, &mut their_tun);
         assert!(
             matches!(result, TunnResult::Err(WireGuardError::InvalidAeadTag)),

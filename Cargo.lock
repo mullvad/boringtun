@@ -853,6 +853,7 @@ dependencies = [
  "wintun-bindings",
  "x25519-dalek",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]

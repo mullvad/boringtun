@@ -10,6 +10,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::PresharedKey;
 use crate::crypto::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use crate::noise::errors::WireGuardError;
 use crate::noise::index_table::{Index, IndexTable};
@@ -34,6 +35,8 @@ pub(crate) const LABEL_MAC1: &[u8; 8] = b"mac1----";
 pub(crate) const LABEL_COOKIE: &[u8; 8] = b"cookie--";
 const KEY_LEN: usize = 32;
 const TIMESTAMP_LEN: usize = 12;
+// WireGuard represents an absent optional PSK by mixing 32 zero bytes.
+const ZERO_PRESHARED_KEY: [u8; KEY_LEN] = [0u8; KEY_LEN];
 
 // initiator.chaining_key = HASH(CONSTRUCTION)
 const INITIAL_CHAIN_KEY: [u8; KEY_LEN] = [
@@ -252,7 +255,7 @@ struct NoiseParams {
     /// A pre-computation of HASH("mac1----", `peer_static_public`) for this peer
     sending_mac1_key: [u8; KEY_LEN],
     /// An optional preshared key
-    preshared_key: Option<[u8; KEY_LEN]>,
+    preshared_key: Option<PresharedKey>,
 }
 
 impl std::fmt::Debug for NoiseParams {
@@ -263,7 +266,10 @@ impl std::fmt::Debug for NoiseParams {
             .field("peer_static_public", &self.peer_static_public)
             .field("static_shared", &"<redacted>")
             .field("sending_mac1_key", &self.sending_mac1_key)
-            .field("preshared_key", &self.preshared_key)
+            .field(
+                "preshared_key",
+                &self.preshared_key.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -403,7 +409,7 @@ impl NoiseParams {
         static_private: x25519::StaticSecret,
         static_public: x25519::PublicKey,
         peer_static_public: x25519::PublicKey,
-        preshared_key: Option<[u8; 32]>,
+        preshared_key: Option<PresharedKey>,
     ) -> NoiseParams {
         let static_shared = static_private.diffie_hellman(&peer_static_public);
 
@@ -435,8 +441,19 @@ impl NoiseParams {
         self.static_shared = self.static_private.diffie_hellman(&self.peer_static_public);
     }
 
-    fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+    fn set_preshared_key(&mut self, preshared_key: Option<PresharedKey>) {
         self.preshared_key = preshared_key;
+    }
+
+    fn preshared_key(&self) -> Option<&PresharedKey> {
+        self.preshared_key.as_ref()
+    }
+
+    fn preshared_key_bytes(&self) -> &[u8; KEY_LEN] {
+        self.preshared_key
+            .as_ref()
+            .map(PresharedKey::as_bytes)
+            .unwrap_or(&ZERO_PRESHARED_KEY)
     }
 }
 
@@ -446,7 +463,7 @@ impl Handshake {
         static_public: x25519::PublicKey,
         peer_static_public: x25519::PublicKey,
         index_table: IndexTable,
-        preshared_key: Option<[u8; 32]>,
+        preshared_key: Option<PresharedKey>,
     ) -> Handshake {
         let params = NoiseParams::new(
             static_private,
@@ -512,16 +529,17 @@ impl Handshake {
         self.previous = HandshakeState::None;
     }
 
-    /// Store the preshared key used by future handshakes.
+    /// Store the preshared key used when a handshake next reaches PSK mixing.
     ///
-    /// Any in-flight handshake and established sessions are deliberately left untouched.
-    pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+    /// Established transport sessions are left untouched. An in-flight
+    /// handshake can fail if its peer generated a message using the old key.
+    pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<PresharedKey>) {
         self.params.set_preshared_key(preshared_key);
     }
 
-    /// Get the preshared key
-    pub(crate) fn preshared_key(&self) -> Option<[u8; 32]> {
-        self.params.preshared_key
+    /// Borrow the configured preshared key.
+    pub(crate) fn preshared_key(&self) -> Option<&PresharedKey> {
+        self.params.preshared_key()
     }
 
     pub(super) fn receive_handshake_initialization(
@@ -649,10 +667,7 @@ impl Handshake {
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, preshared_key)
-        let temp = b2s_hmac(
-            &chaining_key,
-            &self.params.preshared_key.unwrap_or([0u8; 32])[..],
-        );
+        let temp = b2s_hmac(&chaining_key, self.params.preshared_key_bytes());
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp2 = HMAC(temp, responder.chaining_key || 0x2)
@@ -891,10 +906,7 @@ impl Handshake {
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, preshared_key)
-        let temp = b2s_hmac(
-            &chaining_key,
-            &self.params.preshared_key.unwrap_or([0u8; 32])[..],
-        );
+        let temp = b2s_hmac(&chaining_key, self.params.preshared_key_bytes());
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp2 = HMAC(temp, responder.chaining_key || 0x2)

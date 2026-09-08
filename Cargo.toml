@@ -66,6 +66,7 @@ windows-sys = { version = ">=0.60, <=0.61" }
 wintun-bindings = { version = "0.7.39", default-features = false }
 x25519-dalek = "2.0.1"
 zerocopy = "0.8.27"
+zeroize = "1.8.2"
 
 [profile.bench]
 lto = true  # Enable full link-time optimization.

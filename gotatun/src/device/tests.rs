@@ -282,7 +282,7 @@ async fn modify_peer_preshared_key_reaches_tunnel() {
         let updated = device
             .device
             .modify_peer(&peer.public_key, |peer_mut| {
-                peer_mut.set_preshared_key(Some(preshared_key));
+                peer_mut.set_preshared_key(Some(preshared_key.into()));
             })
             .await
             .expect("modify_peer should succeed");
@@ -298,7 +298,35 @@ async fn modify_peer_preshared_key_reaches_tunnel() {
 async fn update_peer_preshared_key_reaches_tunnel() {
     assert_peer_psk_update_reaches_tunnel(async |device: &mut mock::MockDevice, preshared_key| {
         let mut peer = get_first_and_only_peer(device).await;
-        peer.preshared_key = Some(preshared_key);
+        peer.preshared_key = Some(preshared_key.into());
+        let updated = device
+            .device
+            .update_peer(peer)
+            .await
+            .expect("update_peer should succeed");
+        assert!(updated, "peer update should affect an existing peer");
+        advance_mock_clock();
+    })
+    .await;
+}
+
+/// Ensures clearing a peer's preshared key via Device::modify_peer propagates into its noise state.
+#[tokio::test]
+#[test_log::test]
+async fn modify_peer_clear_preshared_key_reaches_tunnel() {
+    assert_peer_psk_clear_reaches_tunnel(async |device: &mut mock::MockDevice| {
+        set_first_peer_preshared_key(device, None).await;
+    })
+    .await;
+}
+
+/// Ensures clearing a peer's preshared key via Device::update_peer propagates into its noise state.
+#[tokio::test]
+#[test_log::test]
+async fn update_peer_clear_preshared_key_reaches_tunnel() {
+    assert_peer_psk_clear_reaches_tunnel(async |device: &mut mock::MockDevice| {
+        let mut peer = get_first_and_only_peer(device).await;
+        peer.preshared_key = None;
         let updated = device
             .device
             .update_peer(peer)
@@ -346,6 +374,61 @@ async fn assert_peer_psk_update_reaches_tunnel(
         set_preshared_key(&mut alice, preshared_key).await;
         send_and_expect_delivery(&alice, &mut bob, &packet).await;
     }
+}
+
+/// Clearing a peer's preshared key must propagate into its noise state, and must
+/// not tear down a live session. `clear_preshared_key` applies the change through
+/// one of the device's configuration APIs.
+async fn assert_peer_psk_clear_reaches_tunnel(
+    clear_preshared_key: impl AsyncFn(&mut mock::MockDevice),
+) {
+    let packet = mock::packet(b"Hello!");
+    let preshared_key = [0xA5; 32];
+
+    // One side clears its PSK: the peers disagree and the next handshake fails.
+    {
+        let (mut alice, mut bob, _eve) = mock::device_pair().await;
+        set_first_peer_preshared_key(&mut alice, Some(preshared_key)).await;
+        set_first_peer_preshared_key(&mut bob, Some(preshared_key)).await;
+        clear_preshared_key(&mut alice).await;
+        send_and_expect_blocked(&alice, &mut bob, &packet).await;
+    }
+
+    // Both sides clear the PSK: traffic flows again.
+    {
+        let (mut alice, mut bob, _eve) = mock::device_pair().await;
+        set_first_peer_preshared_key(&mut alice, Some(preshared_key)).await;
+        set_first_peer_preshared_key(&mut bob, Some(preshared_key)).await;
+        clear_preshared_key(&mut alice).await;
+        clear_preshared_key(&mut bob).await;
+        send_and_expect_delivery(&alice, &mut bob, &packet).await;
+    }
+
+    // Clearing one side after a session is established keeps the live session working.
+    {
+        let (mut alice, mut bob, _eve) = mock::device_pair().await;
+        set_first_peer_preshared_key(&mut alice, Some(preshared_key)).await;
+        set_first_peer_preshared_key(&mut bob, Some(preshared_key)).await;
+        send_and_expect_delivery(&alice, &mut bob, &packet).await;
+        clear_preshared_key(&mut alice).await;
+        send_and_expect_delivery(&alice, &mut bob, &packet).await;
+    }
+}
+
+async fn set_first_peer_preshared_key(
+    device: &mut mock::MockDevice,
+    preshared_key: Option<[u8; 32]>,
+) {
+    let peer = get_first_and_only_peer(device).await;
+    let updated = device
+        .device
+        .modify_peer(&peer.public_key, |peer_mut| {
+            peer_mut.set_preshared_key(preshared_key.map(Into::into));
+        })
+        .await
+        .expect("modify_peer should succeed");
+    assert!(updated, "peer update should affect an existing peer");
+    advance_mock_clock();
 }
 
 /// Return the device's single configured peer, asserting there is exactly one.
