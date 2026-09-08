@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- Bind the UAPI unix socket at `/var/run/wireguard/<name>.sock` without a doubled
+  slash in the path. The kernel previously reported the bound path as
+  `/var/run/wireguard//<name>.sock`, which broke exact-path lookups such as
+  `lsof /var/run/wireguard/<name>.sock`.
 - Apply the dual-stack address mapping on every target served by the generic UDP
   socket implementation, not only Apple targets. Sending to an IPv4 peer on a
   dual-stack socket previously failed with `EAFNOSUPPORT` on those targets, and

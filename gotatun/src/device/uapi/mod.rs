@@ -56,7 +56,7 @@ use std::time::SystemTime;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 #[cfg(unix)]
-const SOCK_DIR: &str = "/var/run/wireguard/";
+const SOCK_DIR: &str = "/var/run/wireguard";
 
 /// A server that receives [`Request`]s. Should be passed to [`DeviceBuilder::with_uapi`].
 ///
