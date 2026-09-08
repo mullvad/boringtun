@@ -292,6 +292,22 @@ impl Packet<[u8]> {
         self.inner.buf.truncate(new_len);
     }
 
+    /// Grow this packet and move the current bytes after a new prefix.
+    ///
+    /// The added prefix and suffix are zero-filled.
+    pub(crate) fn prepend_and_append_space(mut self, prefix_len: usize, suffix_len: usize) -> Self {
+        let old_len = self.inner.buf.len();
+        let new_len = prefix_len
+            .checked_add(old_len)
+            .and_then(|len| len.checked_add(suffix_len))
+            .expect("packet length must fit in usize");
+
+        self.inner.buf.resize(new_len, 0);
+        self.inner.buf.copy_within(0..old_len, prefix_len);
+        self.inner.buf[..prefix_len].fill(0);
+        self
+    }
+
     /// Get direct mutable access to the backing buffer.
     pub fn buf_mut(&mut self) -> &mut BytesMut {
         &mut self.inner.buf
@@ -525,5 +541,41 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Packet").field(&self.deref()).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+
+    use super::Packet;
+
+    #[test]
+    fn prepend_and_append_space_reuses_spare_capacity() {
+        let mut bytes = BytesMut::with_capacity(64);
+        bytes.extend_from_slice(b"payload");
+        let original_ptr = bytes.as_ptr();
+        let packet = Packet::from_bytes(bytes);
+
+        let packet = packet.prepend_and_append_space(4, 3);
+
+        assert_eq!(packet.as_ptr(), original_ptr);
+        assert_eq!(&packet[..4], &[0, 0, 0, 0]);
+        assert_eq!(&packet[4..11], b"payload");
+        assert_eq!(&packet[11..], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn prepend_and_append_space_preserves_payload_after_reallocation() {
+        let mut bytes = BytesMut::with_capacity(7);
+        bytes.extend_from_slice(b"payload");
+        let packet = Packet::from_bytes(bytes);
+
+        let packet = packet.prepend_and_append_space(16, 5);
+
+        assert_eq!(packet.len(), 28);
+        assert_eq!(&packet[..16], &[0; 16]);
+        assert_eq!(&packet[16..23], b"payload");
+        assert_eq!(&packet[23..], &[0, 0, 0, 0, 0]);
     }
 }

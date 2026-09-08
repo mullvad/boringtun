@@ -16,7 +16,7 @@ use crate::{
     noise::index_table::Index,
     packet::{Packet, WgData, WgDataHeader, WgKind},
 };
-use bytes::{Buf, BytesMut};
+use bytes::Buf;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use zerocopy::FromBytes;
@@ -234,12 +234,7 @@ impl Session {
         }
         let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
 
-        let len = WgData::OVERHEAD + packet.len();
-
-        // Prepare a buffer to hold our the WgData packet and our encapsulated payload.
-        // TODO: we can remove this allocation by pre-allocating some extra
-        // space at the beginning of `packet`s allocation, and using that.
-        let mut buf = Packet::from_bytes(BytesMut::zeroed(len));
+        let mut buf = packet.prepend_and_append_space(WgDataHeader::LEN, WgData::TAG_LEN);
 
         let data = WgData::mut_from_bytes(buf.buf_mut())
             .expect("buffer size is at least WgData::OVERHEAD");
@@ -248,11 +243,6 @@ impl Session {
         data.header = WgDataHeader::new()
             .with_receiver_idx(self.sending_index)
             .with_counter(sending_key_counter);
-
-        // Copy inner packet into place.
-        debug_assert_eq!(packet.len(), data.encrypted_encapsulated_packet_mut().len());
-        data.encrypted_encapsulated_packet_mut()
-            .copy_from_slice(&packet);
 
         let mut nonce = [0u8; 12];
         nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
@@ -343,7 +333,7 @@ mod tests {
     /// Craft a (cryptographically invalid) `WgData` packet with a chosen receiver index and
     /// counter, for exercising the receive-path checks that run before decryption.
     fn make_data_packet(receiver_idx: u32, counter: u64) -> Packet<WgData> {
-        let mut buf = Packet::from_bytes(BytesMut::zeroed(WgData::OVERHEAD));
+        let mut buf = Packet::from_bytes(bytes::BytesMut::zeroed(WgData::OVERHEAD));
         let data = WgData::mut_from_bytes(buf.buf_mut()).expect("buffer is WgData::OVERHEAD");
         data.header = WgDataHeader::new()
             .with_receiver_idx(receiver_idx)
@@ -352,6 +342,73 @@ mod tests {
             unreachable!("is a wireguard data packet");
         };
         packet
+    }
+
+    fn linked_sessions() -> (Session, Session) {
+        let table: IndexTable = IndexTable::from_os_rng();
+        let alice_receiving_index = table.new_index();
+        let bob_receiving_index = table.new_index();
+
+        let alice_to_bob_key = [1u8; 32];
+        let bob_to_alice_key = [2u8; 32];
+        let alice = Session::new(
+            alice_receiving_index,
+            bob_receiving_index.value(),
+            bob_to_alice_key,
+            alice_to_bob_key,
+        );
+        let bob = Session::new(bob_receiving_index, 0, alice_to_bob_key, bob_to_alice_key);
+
+        (alice, bob)
+    }
+
+    #[test]
+    fn format_packet_data_round_trips_with_spare_capacity() {
+        let (alice, bob) = linked_sessions();
+
+        let mut bytes = bytes::BytesMut::with_capacity(128);
+        bytes.extend_from_slice(b"hello through the tunnel");
+
+        let packet = Packet::from_bytes(bytes);
+        let wg_packet = alice
+            .format_packet_data(packet)
+            .expect("counter is below reject-after limit");
+
+        assert_eq!(
+            wg_packet.header.receiver_idx.get(),
+            bob.receiving_index.value()
+        );
+        assert_eq!(wg_packet.header.counter.get(), 0);
+
+        let packet = bob
+            .receive_packet_data(wg_packet)
+            .expect("receiver has matching key and index");
+        assert_eq!(&*packet, b"hello through the tunnel");
+    }
+
+    #[test]
+    fn format_packet_data_round_trips_when_buffer_must_grow() {
+        let (alice, bob) = linked_sessions();
+
+        let payload = b"no spare capacity";
+        let mut bytes = bytes::BytesMut::with_capacity(payload.len());
+        bytes.extend_from_slice(payload);
+
+        let packet = Packet::from_bytes(bytes);
+        let wg_packet = alice
+            .format_packet_data(packet)
+            .expect("counter is below reject-after limit");
+
+        assert_eq!(
+            wg_packet.header.receiver_idx.get(),
+            bob.receiving_index.value()
+        );
+        assert_eq!(wg_packet.header.counter.get(), 0);
+
+        let packet = bob
+            .receive_packet_data(wg_packet)
+            .expect("receiver has matching key and index");
+        assert_eq!(&*packet, payload);
     }
 
     /// The receive path must reject a counter at/beyond REJECT_AFTER_MESSAGES before decryption,
