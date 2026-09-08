@@ -155,6 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gotatun::udp::socket::UdpSocketFactory` now uses operating system default values for `SO_SNDBUF`
   and `SO_RCVBUF` (instead of forcibly adjusting them to 7 MB each).
 
+### Changed
+- Use `jemalloc` default memory allocator in `gotatun-cli`.
+
 
 ## [0.6.0] - 2026-04-30
 ### Added
