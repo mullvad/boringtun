@@ -18,7 +18,10 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unali
 mod protocol;
 pub use protocol::*;
 
-use crate::packet::{DecodeError, Decoder, PseudoHeaderV4, Tcp, TcpDecoder, Udp, UdpDecoder};
+use crate::packet::{
+    DecodeError, Decoder, PseudoHeaderV4, Tcp, TcpDecoder, Udp, UdpDecoder,
+    util::checksum_ipv4_with_skip,
+};
 
 use super::util::size_must_be;
 
@@ -442,9 +445,9 @@ impl Ipv4Header {
         self.flags_and_fragment_offset.fragment_offset()
     }
 
-    /// Compute expected header checksum.
+    /// Compute expected header checksum. Only valid if IP header contains no optinal fields.
     pub fn compute_checksum(&self) -> u16 {
-        crate::packet::util::checksum_ipv4_with_skip(self.as_bytes())
+        checksum_ipv4_with_skip(self.as_bytes())
     }
 }
 
@@ -469,12 +472,35 @@ where
             .map_err(|_| eyre!("IPv4 packet was larger than {}", u16::MAX))?;
         Ok(())
     }
+
+    // /// Compute expected IP header checksum.
+    // pub fn calculate_ip_checksum(&self) -> u16 {
+    //     self.header.compute_checksum()
+    // }
+
+    // /// Update IP header checksum field.
+    // pub fn update_ip_checksum(&mut self) {
+    //     let checksum = self.header.compute_checksum();
+    //     self.header.header_checksum.set(checksum);
+    // }
 }
 
 impl<P> Ipv4<Ipv4Options<P>>
 where
     P: TryFromBytes + Immutable + KnownLayout + ?Sized,
 {
+    fn header_bytes(&self) -> eyre::Result<&[u8]> {
+        let header_len = usize::from(self.header.ihl()) * size_of::<u32>();
+
+        if header_len < Ipv4Header::LEN {
+            bail!("Invalid IHL");
+        };
+
+        self.as_bytes()
+            .get(..header_len)
+            .ok_or(eyre!("IHL larger than header"))
+    }
+
     fn options_and_payload_bytes(&self) -> eyre::Result<(&[u8], &[u8])> {
         let header_len = usize::from(self.header.ihl()) * size_of::<u32>();
 
@@ -502,6 +528,18 @@ where
         let bytes = self.payload_bytes()?;
         let payload = P::try_ref_from_bytes(bytes).map_err(|e| eyre!("{e}"))?;
         Ok(payload)
+    }
+
+    /// Compute expected IP header checksum.
+    pub fn calculate_ip_checksum(&self) -> eyre::Result<u16> {
+        Ok(checksum_ipv4_with_skip(self.header_bytes()?))
+    }
+
+    /// Update IP header checksum field.
+    pub fn update_ip_checksum(&mut self) -> eyre::Result<()> {
+        let checksum = self.calculate_ip_checksum()?;
+        self.header.header_checksum.set(checksum);
+        Ok(())
     }
 }
 
