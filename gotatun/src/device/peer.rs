@@ -101,4 +101,10 @@ impl Peer {
         self.danger_timer_params = Some(timer_params);
         self
     }
+
+    /// Override the keepalive for this peer
+    pub fn with_keepalive(mut self, keepalive: Option<u16>) -> Self {
+        self.keepalive = keepalive;
+        self
+    }
 }
